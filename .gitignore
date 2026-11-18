@@ -1,0 +1,24 @@
+# Secrets: never commit real API keys
+.env
+
+# Personal docs: kept local, never committed
+project doc/
+PLAN.md
+notes/
+
+# Python virtual environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# OS / editor clutter
+.DS_Store
+.vscode/
+.idea/

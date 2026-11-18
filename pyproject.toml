@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "knowcode"
+version = "0.1.0"
+description = "Context-aware Python code summarization tailored by team role (COSC 4426)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.40",            # client for the DeepSeek API (OpenAI-compatible)
+    "pydantic>=2.7",           # schemas for LLM responses and pipeline data
+    "pydantic-settings>=2.3",  # typed configuration loaded from .env
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/knowcode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/F: errors and undefined names, I: import order, UP: modern syntax, B: likely bugs
+select = ["E", "F", "I", "UP", "B"]
