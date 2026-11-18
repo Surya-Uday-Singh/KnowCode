@@ -4,14 +4,21 @@ This is the first step of the pipeline and uses no LLM:
 
 1. Syntax check: `ast.parse` either builds a syntax tree or raises
    SyntaxError. Invalid code is rejected here, before any API call is made.
-2. Chunking: every top-level function and class becomes its own Chunk, so
-   the model only ever sees one focused piece of code at a time.
-3. Size check: a class that is too large is split into its methods. A single
-   function that is still too large is reported as a failure; we never
-   silently cut code off, because a summary of half a function is misleading.
+2. Chunking: the file is split into focused pieces so the model only ever
+   sees one piece of code at a time:
+     - every top-level function and class is its own chunk;
+     - code outside any function or class (a "script" section, such as a
+       loop that processes a file or an `if __name__ == "__main__":` block)
+       is grouped into chunks too, one per stretch of statements between
+       definitions.
+3. Size check: anything over the size limit is split at safe boundaries (a
+   class into its methods, a script section between statements). A piece
+   that still doesn't fit is reported as a failure; we never silently cut
+   code off, because a summary of half a function is misleading.
 
-The file's import statements are collected separately so they can be passed
-to the model as context alongside each chunk.
+Lines that only set things up (imports and constant values such as
+`MAX_ROWS = 1000`) aren't worth a summary of their own. Instead they are
+collected as file context and given to the model alongside every chunk.
 
 Run it on a file to see what it produces:
     python -m knowcode.preprocessor path/to/file.py
@@ -23,6 +30,7 @@ import ast
 import math
 import sys
 import textwrap
+import tokenize
 from pathlib import Path
 from typing import Literal
 
@@ -32,11 +40,15 @@ from pydantic import BaseModel, ConfigDict
 # Accurate enough for a size limit and avoids depending on a tokenizer library.
 CHARS_PER_TOKEN = 4
 
-# A method split out of a class is still kind "function"; its `parent` field
-# records which class it came from.
-ChunkKind = Literal["function", "class"]
+# Constants longer than this aren't copied into the shared file context,
+# because that context is repeated in every prompt for the file.
+MAX_CONSTANT_CONTEXT_CHARS = 200
 
-# The syntax tree node types that we turn into chunks.
+# A method split out of a class is still kind "function"; its `parent` field
+# records which class it came from. "script" is code outside any definition.
+ChunkKind = Literal["function", "class", "script"]
+
+# The syntax tree node types for function and class definitions.
 _DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
@@ -46,11 +58,14 @@ _DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
 class Chunk(BaseModel):
-    """One unit of code to summarize: a function, a class, or a method."""
+    """One unit of code to summarize: a function, a class, a method, or a
+    section of script code."""
 
     model_config = ConfigDict(frozen=True)  # read-only once created
 
-    name: str  # e.g. "round_price", or "Cart.add" for a method split out of a class
+    # e.g. "round_price", "Cart.add" for a method split out of a class,
+    # or "script (lines 7-11)" for script code, which has no name of its own.
+    name: str
     kind: ChunkKind
     source: str  # exact source text including decorators, dedented to column 0
     start_line: int  # 1-based, inclusive, in the original file
@@ -60,7 +75,7 @@ class Chunk(BaseModel):
 
 
 class ChunkFailure(BaseModel):
-    """A function or class that was found but couldn't be turned into a chunk."""
+    """A piece of code that was found but couldn't be turned into a chunk."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -76,9 +91,12 @@ class ChunkFailure(BaseModel):
 class PreprocessResult(BaseModel):
     """Everything later steps need from one source file."""
 
-    imports: list[str]  # import statements exactly as written in the file
+    # File context, sent to the model with every chunk from this file.
+    imports: list[str]  # import statements exactly as written
+    constants: list[str]  # short module-level constant assignments, e.g. "MAX_ROWS = 1000"
+
     chunks: list[Chunk]  # in the order they appear in the file
-    failures: list[ChunkFailure]  # definitions we refused to send (e.g. too large)
+    failures: list[ChunkFailure]  # pieces we refused to send (e.g. too large)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +122,7 @@ class CodeSyntaxError(InputError):
 
 
 class NothingToSummarizeError(InputError):
-    """The source is valid Python but defines no functions or classes."""
+    """The source contains no code at all (it's empty or only comments)."""
 
 
 # ---------------------------------------------------------------------------
@@ -129,45 +147,94 @@ def preprocess(source: str, max_chunk_tokens: int | None = None) -> PreprocessRe
 
         max_chunk_tokens = get_settings().max_chunk_tokens
 
+    source = _normalize(source)
     tree = _parse(source)
+    if not tree.body:
+        raise NothingToSummarizeError("The input contains no code, only blank lines or comments.")
+
     # keepends=True keeps the "\n" on each line, so joining lines back
     # together reproduces the original text exactly.
     lines = source.splitlines(keepends=True)
 
     imports = _collect_imports(tree, source)
+    constants: list[str] = []
     chunks: list[Chunk] = []
     failures: list[ChunkFailure] = []
 
-    # Only look at top-level statements. Anything nested inside a function or
-    # class is handled as part of that definition.
+    # Walk the top-level statements in order. Definitions become chunks right
+    # away; everything else is gathered into `section` until the next
+    # definition (or the end of the file) closes that stretch of script code.
+    section: list[ast.stmt] = []
+
+    def close_section() -> None:
+        if not section:
+            return
+        if all(_is_setup(stmt) for stmt in section):
+            # Only imports/constants: no summary, but keep constants as context.
+            constants.extend(_constant_lines(section, source))
+        else:
+            # Imports and docstrings at the top of a script section are already
+            # sent as file context, so leave them out of the chunk to avoid
+            # showing the model the same lines twice.
+            work = list(section)
+            while _is_import_or_docstring(work[0]):
+                work.pop(0)
+            _chunk_script(work, lines, max_chunk_tokens, chunks, failures)
+        section.clear()
+
     for node in tree.body:
         if isinstance(node, _DEF_NODES):
+            close_section()
             _chunk_node(
                 node, lines, max_chunk_tokens, parent=None, chunks=chunks, failures=failures
             )
+        else:
+            section.append(node)
+    close_section()
 
-    # Valid code with no definitions (e.g. a plain script) gives the model
-    # nothing to work on, so treat it as unusable input.
+    # A file made only of setup lines (e.g. a settings file full of constants)
+    # would otherwise produce nothing. Summarize the whole file as script code
+    # instead of rejecting it. Its constants are now in the chunk itself, so
+    # they don't also need to be sent as context.
     if not chunks and not failures:
-        raise NothingToSummarizeError(
-            "No functions or classes were found, so there is nothing to summarize."
-        )
+        constants.clear()
+        _chunk_script(tree.body, lines, max_chunk_tokens, chunks, failures)
 
-    return PreprocessResult(imports=imports, chunks=chunks, failures=failures)
+    return PreprocessResult(imports=imports, constants=constants, chunks=chunks, failures=failures)
 
 
 def preprocess_file(path: str | Path, max_chunk_tokens: int | None = None) -> PreprocessResult:
-    """Read a .py file and run `preprocess` on its contents."""
+    """Read a .py file and run `preprocess` on its contents.
+
+    tokenize.open decodes the file the same way the Python interpreter does:
+    it honours an encoding declaration such as `# -*- coding: latin-1 -*-`,
+    defaults to UTF-8, and strips a UTF-8 byte order mark if there is one.
+    """
     try:
-        source = Path(path).read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise InputError(f"{path} is not valid UTF-8 text: {exc}") from exc
+        with tokenize.open(path) as f:
+            source = f.read()
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        # SyntaxError here means an invalid encoding declaration, not bad code.
+        raise InputError(f"Could not read {path} as Python source text: {exc}") from exc
     return preprocess(source, max_chunk_tokens)
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Parsing helpers
 # ---------------------------------------------------------------------------
+
+
+def _normalize(source: str) -> str:
+    """Clean up pasted source so valid code isn't rejected for cosmetic reasons.
+
+    - Drops a leading byte order mark (an invisible character some Windows
+      editors put at the start of a file), which ast.parse rejects.
+    - Removes indentation shared by every line. A method copied out of a class
+      arrives indented, and Python refuses code whose first line is indented.
+      Normal files already start at column 0, so this changes nothing for them,
+      and line numbers are never affected.
+    """
+    return textwrap.dedent(source.removeprefix("﻿"))
 
 
 def _parse(source: str) -> ast.Module:
@@ -210,6 +277,91 @@ def _collect_imports(tree: ast.Module, source: str) -> list[str]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# Setup lines and file context
+# ---------------------------------------------------------------------------
+
+
+def _is_literal(node: ast.expr) -> bool:
+    """True if `node` is a plain value written directly in the code, such as
+    1000, "abc", None, [1, 2] or {"a": 1}, as opposed to something computed
+    by calling code, such as open("data.csv") or load_config()."""
+    try:
+        ast.literal_eval(node)
+        return True
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+
+
+def _is_import_or_docstring(stmt: ast.stmt) -> bool:
+    """True for an import statement or a bare string (docstring) on its own line."""
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return True
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _is_setup(stmt: ast.stmt) -> bool:
+    """True if a top-level statement only sets things up rather than doing work.
+
+    Setup means: imports, the module docstring, `pass`, and assignments of
+    literal values (MAX_ROWS = 1000). An `if` or `try` block counts as setup
+    when everything inside it is setup, which covers patterns like
+    `try: import json / except ImportError: json = None`.
+
+    Anything else (function calls, loops, `with` blocks, assignments whose
+    value is computed) is real work and belongs in a script chunk.
+    """
+    if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+        return True
+    if isinstance(stmt, ast.Expr):
+        # A bare string on its own line is a docstring or a comment-like note.
+        return isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
+    if isinstance(stmt, ast.Assign):
+        return _is_literal(stmt.value)
+    if isinstance(stmt, ast.AnnAssign):
+        # `x: int` (no value) is just a type declaration.
+        return stmt.value is None or _is_literal(stmt.value)
+    if isinstance(stmt, (ast.If, ast.Try, ast.TryStar)):
+        inner = [*stmt.body, *stmt.orelse, *getattr(stmt, "finalbody", [])]
+        for handler in getattr(stmt, "handlers", []):
+            inner.extend(handler.body)
+        return all(_is_setup(s) for s in inner)
+    return False
+
+
+def _constant_lines(statements: list[ast.stmt], source: str) -> list[str]:
+    """Return the short, one-line constant assignments among `statements`.
+
+    These are shared with every chunk as context, so a function that uses
+    MAX_ROWS is summarized knowing that MAX_ROWS is 1000. Multi-line values
+    (e.g. a large lookup table) are left out to keep every prompt small.
+    """
+    found: list[str] = []
+    for stmt in statements:
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            continue
+        if stmt.lineno != stmt.end_lineno:
+            continue
+        text = ast.get_source_segment(source, stmt) or ast.unparse(stmt)
+        if len(text) <= MAX_CONSTANT_CONTEXT_CHARS:
+            found.append(text)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Building chunks
+# ---------------------------------------------------------------------------
+
+
+def _source_lines(lines: list[str], start: int, end: int) -> str:
+    """Return lines start..end (1-based, inclusive), dedented to column 0."""
+    return textwrap.dedent("".join(lines[start - 1 : end]))
+
+
 def _node_source(node: ast.AST, lines: list[str]) -> tuple[str, int, int]:
     """Return (source text, start line, end line) for a function or class node.
 
@@ -223,8 +375,24 @@ def _node_source(node: ast.AST, lines: list[str]) -> tuple[str, int, int]:
     decorators = getattr(node, "decorator_list", [])
     start = min([d.lineno for d in decorators] + [node.lineno])
     end = node.end_lineno
-    text = textwrap.dedent("".join(lines[start - 1 : end]))  # line numbers are 1-based
-    return text, start, end
+    return _source_lines(lines, start, end), start, end
+
+
+def _too_large(
+    name: str, kind: ChunkKind, start: int, end: int, tokens: int, max_tokens: int
+) -> ChunkFailure:
+    return ChunkFailure(
+        name=name,
+        kind=kind,
+        start_line=start,
+        end_line=end,
+        reason="too_large",
+        message=(
+            f"{kind} `{name}` is about {tokens} tokens, over the limit of "
+            f"{max_tokens}, and cannot be split further."
+        ),
+        estimated_tokens=tokens,
+    )
 
 
 def _chunk_node(
@@ -272,20 +440,56 @@ def _chunk_node(
 
     # Too large and can't be split any further (a single function, or a class
     # with no methods): report it instead of truncating the code.
-    failures.append(
-        ChunkFailure(
-            name=name,
-            kind=kind,
-            start_line=start,
-            end_line=end,
-            reason="too_large",
-            message=(
-                f"{kind} `{name}` is about {tokens} tokens, over the limit of "
-                f"{max_tokens}, and cannot be split further."
-            ),
-            estimated_tokens=tokens,
-        )
-    )
+    failures.append(_too_large(name, kind, start, end, tokens, max_tokens))
+
+
+def _chunk_script(
+    statements: list[ast.stmt],
+    lines: list[str],
+    max_tokens: int,
+    chunks: list[Chunk],
+    failures: list[ChunkFailure],
+) -> None:
+    """Turn a stretch of top-level statements into one or more "script" chunks.
+
+    Statements are packed into a chunk until adding the next one would go over
+    the size limit; then a new chunk starts. Splits only ever happen between
+    complete statements, so a loop or `with` block is never cut in half. A
+    single statement that's over the limit on its own is reported as a failure.
+    """
+    group: list[ast.stmt] = []
+
+    def emit() -> None:
+        start, end = group[0].lineno, group[-1].end_lineno
+        source = _source_lines(lines, start, end)
+        tokens = estimate_tokens(source)
+        name = f"script (lines {start}-{end})"
+        if tokens <= max_tokens:
+            chunks.append(
+                Chunk(
+                    name=name,
+                    kind="script",
+                    source=source,
+                    start_line=start,
+                    end_line=end,
+                    estimated_tokens=tokens,
+                )
+            )
+        else:
+            failures.append(_too_large(name, "script", start, end, tokens, max_tokens))
+
+    for stmt in statements:
+        if group:
+            candidate = _source_lines(lines, group[0].lineno, stmt.end_lineno)
+            # Statements sharing a line (`a = 1; b = 2`) can't be separated,
+            # because chunks are cut on line boundaries.
+            starts_new_line = stmt.lineno > group[-1].end_lineno
+            if estimate_tokens(candidate) > max_tokens and starts_new_line:
+                emit()
+                group = []
+        group.append(stmt)
+    if group:
+        emit()
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +510,9 @@ def _main(argv: list[str]) -> int:
     print(f"Imports ({len(result.imports)}):")
     for imp in result.imports:
         print(f"  {imp}")
+    print(f"\nConstants ({len(result.constants)}):")
+    for const in result.constants:
+        print(f"  {const}")
     print(f"\nChunks ({len(result.chunks)}):")
     for c in result.chunks:
         parent = f", parent={c.parent}" if c.parent else ""

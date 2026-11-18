@@ -38,14 +38,52 @@ def test_syntax_error_is_reported_with_its_line_number():
     assert info.value.category == "input"
 
 
+# --- Messy real-world input -------------------------------------------------
+
+
+def test_snippet_pasted_with_indentation_is_accepted():
+    # A method copied out of the middle of a class keeps its leading spaces.
+    snippet = "    def total(self):\n        return self.price * self.qty\n"
+    result = preprocess(snippet, NO_LIMIT)
+    assert [c.name for c in result.chunks] == ["total"]
+    assert result.chunks[0].source.startswith("def total(self):")
+    assert result.chunks[0].start_line == 1
+
+
+def test_leading_byte_order_mark_in_text_is_ignored():
+    result = preprocess("﻿def f():\n    return 1\n", NO_LIMIT)
+    assert [c.name for c in result.chunks] == ["f"]
+
+
+def test_file_with_byte_order_mark_is_read(tmp_path):
+    path = tmp_path / "bom.py"
+    path.write_bytes(b"\xef\xbb\xbfdef f():\n    return 1\n")
+    assert [c.name for c in preprocess_file(path, NO_LIMIT).chunks] == ["f"]
+
+
+def test_file_with_latin1_encoding_declaration_is_read(tmp_path):
+    path = tmp_path / "latin1.py"
+    text = "# -*- coding: latin-1 -*-\ndef greet():\n    return 'café'\n"
+    path.write_bytes(text.encode("latin-1"))
+    [chunk] = preprocess_file(path, NO_LIMIT).chunks
+    assert "café" in chunk.source
+
+
+def test_messy_formatting_is_accepted():
+    # Tabs, odd spacing, trailing comments, one-line defs and Windows line endings.
+    source = "import os,sys\r\n\r\ndef  f( a,b ):\r\n\treturn a+b   # add\r\nclass   X : pass\r\n"
+    result = preprocess(source, NO_LIMIT)
+    assert [c.name for c in result.chunks] == ["f", "X"]
+
+
 def test_empty_source_has_nothing_to_summarize():
     with pytest.raises(NothingToSummarizeError):
         preprocess("", NO_LIMIT)
 
 
-def test_script_with_no_functions_or_classes_has_nothing_to_summarize():
+def test_comment_only_source_has_nothing_to_summarize():
     with pytest.raises(NothingToSummarizeError):
-        preprocess("import os\nx = 1\nprint(x)\n", NO_LIMIT)
+        preprocess("# just a comment\n\n# and another\n", NO_LIMIT)
 
 
 # --- Chunking ---------------------------------------------------------------
@@ -94,9 +132,10 @@ def test_nested_function_stays_inside_its_parent_chunk():
     assert "def apply_discount" in cart.source
 
 
-def test_module_level_constants_are_not_included_in_chunks():
+def test_module_level_constants_become_context_not_chunks():
     result = preprocess_file(SAMPLE, NO_LIMIT)
     assert all("MAX_ITEMS = 50" not in c.source for c in result.chunks)
+    assert result.constants == ["MAX_ITEMS = 50", "DISCOUNT_THRESHOLD = 100.0"]
 
 
 def test_every_chunk_is_valid_python_on_its_own():
@@ -174,3 +213,144 @@ def test_oversized_class_with_no_methods_is_reported():
     assert result.chunks == []
     assert result.failures[0].name == "Table"
     assert result.failures[0].kind == "class"
+
+
+# --- Script code (statements outside any function or class) ----------------
+
+
+def test_file_with_only_script_code_becomes_one_script_chunk():
+    source = code(
+        """
+        import csv
+        for row in csv.reader(open("data.csv")):
+            print(row)
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+
+    [chunk] = result.chunks
+    assert chunk.kind == "script"
+    assert chunk.name == "script (lines 2-3)"
+    # The import is file context, so the chunk starts at the loop.
+    assert chunk.source.startswith("for row in")
+    assert result.imports == ["import csv"]
+
+
+def test_mixed_file_gets_function_and_script_chunks_in_order():
+    source = code(
+        """
+        import csv
+        MAX_ROWS = 1000
+
+        def clean(row):
+            return [c.strip() for c in row]
+
+        rows = []
+        with open("data.csv") as f:
+            for row in csv.reader(f):
+                rows.append(clean(row))
+        print(len(rows), "rows loaded")
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+
+    assert [(c.name, c.kind) for c in result.chunks] == [
+        ("clean", "function"),
+        ("script (lines 7-11)", "script"),
+    ]
+    # The setup lines at the top don't get a summary, but the constant is
+    # shared as context so `clean` and the script are summarized knowing it.
+    assert result.constants == ["MAX_ROWS = 1000"]
+    # `rows = []` is part of the work below it, so it stays in the script chunk
+    # instead of being treated as a setup constant.
+    assert result.chunks[1].source.startswith("rows = []")
+
+
+def test_main_guard_block_becomes_a_script_chunk():
+    source = code(
+        """
+        def main():
+            return 0
+
+        if __name__ == "__main__":
+            main()
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+    assert [c.kind for c in result.chunks] == ["function", "script"]
+    assert result.chunks[1].source.startswith('if __name__ == "__main__":')
+
+
+def test_computed_assignments_count_as_work_not_setup():
+    # A data script made only of assignments is still doing real work,
+    # because the values come from function calls rather than literals.
+    source = code(
+        """
+        import pandas as pd
+        df = pd.read_csv("sales.csv")
+        totals = df.groupby("region").sum()
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+    assert [c.kind for c in result.chunks] == ["script"]
+    assert result.constants == []
+
+
+def test_file_with_only_setup_lines_is_summarized_as_a_whole():
+    # e.g. a settings file. It has no "work", but it shouldn't be rejected.
+    source = code(
+        """
+        \"\"\"Default settings.\"\"\"
+        import os
+        TIMEOUT = 30
+        RETRIES = 3
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+
+    [chunk] = result.chunks
+    assert chunk.kind == "script"
+    assert "TIMEOUT = 30" in chunk.source
+    # The constants are already inside the chunk, so they aren't repeated as context.
+    assert result.constants == []
+
+
+def test_try_import_fallback_counts_as_setup():
+    source = code(
+        """
+        try:
+            import json
+        except ImportError:
+            json = None
+
+        def dump(x):
+            return json.dumps(x)
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+    assert [c.name for c in result.chunks] == ["dump"]
+
+
+def test_long_script_is_split_between_statements():
+    source = "".join(f"print('step {i}')\n" for i in range(30))
+    limit = estimate_tokens(source) // 3  # forces several pieces
+    result = preprocess(source, limit)
+
+    assert len(result.chunks) > 1
+    assert result.failures == []
+    # Pieces cover every line exactly once, in order, with no gaps or overlaps.
+    covered = [n for c in result.chunks for n in range(c.start_line, c.end_line + 1)]
+    assert covered == list(range(1, 31))
+    for chunk in result.chunks:
+        assert chunk.estimated_tokens <= limit
+        ast.parse(chunk.source)
+
+
+def test_script_statement_too_large_on_its_own_is_reported():
+    loop = "for i in range(10):\n" + "    total = i * 2\n" * 40
+    result = preprocess(loop, max_chunk_tokens=20)
+
+    assert result.chunks == []
+    [failure] = result.failures
+    assert failure.kind == "script"
+    assert failure.reason == "too_large"
