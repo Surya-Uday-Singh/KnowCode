@@ -12,7 +12,8 @@ from knowcode.config import MissingApiKeyError, Settings
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """Remove any KnowCode/DeepSeek variables set in the shell running the tests."""
+    """Clear KnowCode/DeepSeek variables from the environment so a developer's
+    shell settings can't change test results. Runs before every test."""
     for name in [
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_BASE_URL",
@@ -24,11 +25,12 @@ def clean_env(monkeypatch):
         "KNOWCODE_MAX_TECHNICAL_RETRIES",
         "KNOWCODE_MAX_QUALITY_RETRIES",
         "KNOWCODE_PASS_THRESHOLD",
+        "KNOWCODE_MAX_CHUNK_TOKENS",
     ]:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_defaults_match_design_doc():
+def test_default_values():
     s = Settings(_env_file=None)
     assert s.generator_temperature == 0.3
     assert s.critic_temperature == 0.0
@@ -37,6 +39,7 @@ def test_defaults_match_design_doc():
     assert s.max_technical_retries == 3
     assert s.max_quality_retries == 1
     assert s.pass_threshold == 4
+    assert s.max_chunk_tokens == 6000
     assert s.deepseek_base_url == "https://api.deepseek.com"
 
 
