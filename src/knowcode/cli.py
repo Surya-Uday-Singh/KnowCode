@@ -2,14 +2,16 @@
 
     knowcode summarize FILE --role {developer,qa,pm} --granularity {function,file}
                             [--format {md,json}] [--output OUT] [--chunk NAME]
+                            [--log-dir DIR | --no-log]
 
 FILE may be "-" to read a pasted snippet from standard input. The result goes
 to standard output (or to --output); progress lines go to standard error, so
-a saved result never has progress mixed into it.
+a saved result never has progress mixed into it. Every run is logged to its
+own folder under runs/ (see runlog.py) unless --no-log is given.
 
 Exit codes: 0 when the run finished (even if some parts couldn't be
 summarized), 1 for bad input or usage, 2 when the run was stopped (no API
-key, a rejected key, an empty account).
+key, a rejected key, an empty account), 130 when interrupted with Ctrl-C.
 """
 
 from __future__ import annotations
@@ -20,14 +22,16 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
-from knowcode.config import MissingApiKeyError, Settings
+from knowcode.config import MissingApiKeyError, Settings, get_settings
 from knowcode.llm import DeepSeekClient, LLMClient, LLMError, estimate_cost_cny
 from knowcode.output import build_report, render, status_short
 from knowcode.pipeline import ChunkOutcome, summarize_file
-from knowcode.preprocessor import InputError, PreprocessResult, preprocess, preprocess_file
+from knowcode.preprocessor import InputError, PreprocessResult, preprocess, read_source
 from knowcode.prompts import Role
+from knowcode.runlog import RunLog
 
 EXIT_OK, EXIT_BAD_INPUT, EXIT_STOPPED = 0, 1, 2
+EXIT_INTERRUPTED = 130  # the usual exit code after Ctrl-C
 
 
 class _UsageError(Exception):
@@ -72,6 +76,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     summarize.add_argument("--output", type=Path, help="write the result to this file")
     summarize.add_argument("--chunk", help="only summarize the part with this name")
+    logging = summarize.add_mutually_exclusive_group()
+    logging.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("runs"),
+        help="folder for run logs (default: runs); each run gets its own subfolder",
+    )
+    logging.add_argument("--no-log", action="store_true", help="don't save a run log")
     return parser
 
 
@@ -96,8 +108,10 @@ def main(
         print(error, file=stderr)
         return EXIT_BAD_INPUT
 
+    settings = settings or get_settings()
     try:
-        source, result = _read_input(args.path, stdin)
+        source, source_text = _read_input(args.path, stdin)
+        result = preprocess(source_text, settings.max_chunk_tokens)
     except (InputError, OSError, UnicodeDecodeError) as error:
         print(f"knowcode: cannot read {args.path}: {error}", file=stderr)
         return EXIT_BAD_INPUT
@@ -111,18 +125,50 @@ def main(
     role = Role(args.role)
     try:
         client = client_factory() if client_factory else DeepSeekClient(settings)
-        outcomes = summarize_file(
-            result, role, client, settings, progress=lambda d, t, o: _progress(d, t, o, stderr)
-        )
     except MissingApiKeyError as error:
         print(f"knowcode: {error}", file=stderr)
         return EXIT_STOPPED
+
+    log = None
+    if not args.no_log:
+        try:
+            log = RunLog(
+                args.log_dir,
+                inputs=_inputs(args, source),
+                settings=settings,
+                source_text=source_text,
+            )
+        except OSError as error:
+            print(f"knowcode: cannot create a run log in {args.log_dir}: {error}", file=stderr)
+            return EXIT_BAD_INPUT
+
+    finished: list[ChunkOutcome] = []
+
+    def on_progress(done: int, total: int, outcome: ChunkOutcome) -> None:
+        finished.append(outcome)
+        if log:
+            log.add_part(outcome)
+        _progress(done, total, outcome, stderr)
+
+    try:
+        outcomes = summarize_file(result, role, client, settings, progress=on_progress)
     except LLMError as error:  # only errors that stop the whole run get this far
         print(f"knowcode: run stopped: {error}", file=stderr)
+        if log:
+            log.finish("stopped", finished, error=f"{type(error).__name__}: {error}")
+            print(f"Run log (partial): {log.path}", file=stderr)
         return EXIT_STOPPED
+    except KeyboardInterrupt:
+        print("knowcode: interrupted", file=stderr)
+        if log:
+            log.finish("interrupted", finished)
+            print(f"Run log (partial): {log.path}", file=stderr)
+        return EXIT_INTERRUPTED
 
     report = build_report(source, role, args.granularity, result, outcomes)
     text = render(report, args.format)
+    if log:
+        log.finish("finished", outcomes, text, args.format)
     if args.output:
         try:
             args.output.write_text(text, encoding="utf-8")
@@ -135,13 +181,27 @@ def main(
     print(_totals(outcomes), file=stderr)
     if args.output:
         print(f"Written to {args.output}", file=stderr)
+    if log:
+        print(f"Run log: {log.path}", file=stderr)
     return EXIT_OK
 
 
-def _read_input(path: str, stdin: TextIO) -> tuple[str, PreprocessResult]:
+def _read_input(path: str, stdin: TextIO) -> tuple[str, str]:
+    """The name to show for the input, and its source text."""
     if path == "-":
-        return "snippet", preprocess(stdin.read())
-    return path, preprocess_file(path)
+        return "snippet", stdin.read()
+    return path, read_source(path)
+
+
+def _inputs(args: argparse.Namespace, source: str) -> dict[str, object]:
+    return {
+        "source": source,
+        "role": args.role,
+        "granularity": args.granularity,
+        "format": args.format,
+        "chunk": args.chunk,
+        "output": str(args.output) if args.output else None,
+    }
 
 
 def _only_chunk(result: PreprocessResult, name: str) -> PreprocessResult:

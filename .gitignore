@@ -22,3 +22,6 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# Run logs: full prompts and code, kept local
+runs/

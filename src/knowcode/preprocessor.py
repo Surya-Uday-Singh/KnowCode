@@ -269,7 +269,12 @@ def preprocess(source: str, max_chunk_tokens: int | None = None) -> PreprocessRe
 
 
 def preprocess_file(path: str | Path, max_chunk_tokens: int | None = None) -> PreprocessResult:
-    """Read a .py file and run `preprocess` on its contents.
+    """Read a .py file and run `preprocess` on its contents."""
+    return preprocess(read_source(path), max_chunk_tokens)
+
+
+def read_source(path: str | Path) -> str:
+    """Read a .py file as text.
 
     tokenize.open decodes the file the same way the Python interpreter does:
     it honours an encoding declaration such as `# -*- coding: latin-1 -*-`,
@@ -277,11 +282,10 @@ def preprocess_file(path: str | Path, max_chunk_tokens: int | None = None) -> Pr
     """
     try:
         with tokenize.open(path) as f:
-            source = f.read()
+            return f.read()
     except (SyntaxError, UnicodeDecodeError) as exc:
         # SyntaxError here means an invalid encoding declaration, not bad code.
         raise InputError(f"Could not read {path} as Python source text: {exc}") from exc
-    return preprocess(source, max_chunk_tokens)
 
 
 # ---------------------------------------------------------------------------

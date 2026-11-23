@@ -20,10 +20,13 @@ SAMPLE = str(Path(__file__).parent / "fixtures" / "sample_cart.py")
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
+def clean_env(monkeypatch, tmp_path):
     for name in list(os.environ):
         if name.startswith(("KNOWCODE_", "DEEPSEEK_")):
             monkeypatch.delenv(name)
+    # Run each test in its own folder, so run logs (written to ./runs by
+    # default) never land in the project.
+    monkeypatch.chdir(tmp_path)
 
 
 def passing(role, name, kind="function"):
