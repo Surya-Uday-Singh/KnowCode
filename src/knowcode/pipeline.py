@@ -22,14 +22,13 @@ The number of quality retries is capped (1 by default), so the loop always
 ends. Technical retries (timeouts, empty replies) happen inside the LLM
 client and don't count against it.
 
-Try it on real code (needs DEEPSEEK_API_KEY):
-    python -m knowcode.pipeline tests/fixtures/sample_cart.py --role qa --chunk round_price
+The `knowcode` command (cli.py) runs this on a file and renders the results.
 """
 
 from __future__ import annotations
 
-import sys
 import traceback
+from collections.abc import Callable
 from typing import Literal
 
 from pydantic import BaseModel
@@ -244,14 +243,19 @@ def summarize_file(
     role: Role,
     client: LLMClient,
     settings: Settings | None = None,
+    progress: Callable[[int, int, ChunkOutcome], None] | None = None,
 ) -> list[ChunkOutcome]:
     """Run every chunk of a preprocessed file, in file order. Chunks the
     preprocessor refused appear as "too_large"; a bug in our own code while
     handling one chunk is recorded as "component_failure" and the run goes on
-    with the next chunk."""
+    with the next chunk.
+
+    `progress`, if given, is called after each chunk with (chunks done, total
+    chunks, that chunk's outcome), e.g. to print a progress line.
+    """
     settings = settings or get_settings()
     outcomes: list[ChunkOutcome] = []
-    for chunk in result.chunks:
+    for done, chunk in enumerate(result.chunks, 1):
         try:
             outcome = summarize_chunk(
                 chunk, role, result.imports, result.constants, client, settings
@@ -263,6 +267,8 @@ def summarize_file(
         except Exception as error:  # noqa: BLE001 - recorded as a bug in our code, not raised
             outcome = _component_failure(chunk, role, error)
         outcomes.append(outcome)
+        if progress is not None:
+            progress(done, len(result.chunks), outcome)
 
     for failure in result.failures:
         outcomes.append(
@@ -423,83 +429,3 @@ def _component_failure(chunk: Chunk, role: Role, error: BaseException) -> ChunkO
         status="component_failure",
         error=details,
     )
-
-
-# ---------------------------------------------------------------------------
-# Command line: run the loop on a real file
-# ---------------------------------------------------------------------------
-
-
-def _main(argv: list[str]) -> int:
-    import argparse
-    import json
-    from pathlib import Path
-
-    from knowcode.config import MissingApiKeyError
-    from knowcode.llm import DeepSeekClient, estimate_cost_cny
-    from knowcode.preprocessor import InputError, preprocess_file
-
-    parser = argparse.ArgumentParser(description="Summarize a Python file for one role.")
-    parser.add_argument("path", type=Path)
-    parser.add_argument("--role", choices=[r.value for r in Role], default=Role.QA.value)
-    parser.add_argument("--chunk", help="only this chunk (default: every chunk)")
-    args = parser.parse_args(argv)
-
-    try:
-        result = preprocess_file(args.path)
-    except InputError as error:
-        print(f"Input error: {error}", file=sys.stderr)
-        return 1
-    if args.chunk:
-        result = result.model_copy(
-            update={
-                "chunks": [c for c in result.chunks if c.name == args.chunk],
-                "failures": [f for f in result.failures if f.name == args.chunk],
-            }
-        )
-        if not result.chunks and not result.failures:
-            print(f"No chunk named {args.chunk!r} in {args.path}.", file=sys.stderr)
-            return 1
-
-    try:
-        outcomes = summarize_file(result, Role(args.role), DeepSeekClient())
-    except MissingApiKeyError as error:
-        print(error, file=sys.stderr)
-        return 1
-    except LLMError as error:
-        print(f"Run stopped. {type(error).__name__}: {error}", file=sys.stderr)
-        return 1
-
-    total = 0.0
-    for outcome in outcomes:
-        replies = outcome.replies()
-        cost = sum(estimate_cost_cny(r) or 0 for r in replies)
-        seconds = sum(r.elapsed_seconds for r in replies)
-        total += cost
-        print(f"\n=== {outcome.chunk_name} ({outcome.kind}): {outcome.status} ===")
-        for draft in outcome.drafts:
-            reads = [read.score for read in draft.reads]
-            why = f" (retry: {draft.retry_reason})" if draft.retry_reason else ""
-            line = f"draft {draft.number}{why}: "
-            if draft.error:
-                line += draft.error
-            elif not draft.usable:
-                line += "unusable: " + ", ".join(e.code for e in draft.check.errors)
-            else:
-                rule = ", ".join(e.code for e in draft.rule_errors) or "none"
-                line += f"critic reads {reads} → {draft.score}; rule errors: {rule}"
-            print(line)
-            if draft.critique:
-                print(f"  critique: {draft.critique}")
-        if outcome.error:
-            print(outcome.error)
-        if outcome.summary:
-            print(f"kept draft {outcome.best_draft}:")
-            print(json.dumps(outcome.summary.model_dump(), indent=2, ensure_ascii=False))
-        print(f"{len(replies)} LLM calls, {seconds:.0f} s, about ¥{cost:.4f}")
-    print(f"\nTotal: about ¥{total:.4f} (deepseek-flash off-peak prices)")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(_main(sys.argv[1:]))

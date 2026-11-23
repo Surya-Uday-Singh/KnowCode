@@ -14,6 +14,10 @@ dependencies = [
     "pydantic-settings>=2.3",  # typed configuration loaded from .env
 ]
 
+# Installs the `knowcode` command, which runs knowcode.cli:main.
+[project.scripts]
+knowcode = "knowcode.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
