@@ -36,26 +36,53 @@ class Settings(BaseSettings):
     deepseek_base_url: str = Field(
         default="https://api.deepseek.com", validation_alias="DEEPSEEK_BASE_URL"
     )
-    deepseek_model: str = Field(default="deepseek-chat", validation_alias="DEEPSEEK_MODEL")
+    deepseek_model: str = Field(default="deepseek-flash", validation_alias="DEEPSEEK_MODEL")
+    # Optional separate model for the critic (e.g. a stronger one). Empty means
+    # the critic uses deepseek_model too.
+    deepseek_critic_model: str | None = Field(
+        default=None, validation_alias="DEEPSEEK_CRITIC_MODEL"
+    )
 
     # --- Model parameters ----------------------------------------------------
-    # The generator gets a little randomness for more natural writing; the
-    # critic runs at 0.0 so the same draft gets the same score every time.
+    # Thinking mode makes the model reason step by step before answering. The
+    # critic uses it, because checking every claim against the code is a
+    # reasoning task; the generator doesn't need it. With thinking on, the API
+    # ignores temperature, and the reasoning counts towards max_tokens.
+    generator_thinking: bool = Field(default=False, validation_alias="KNOWCODE_GENERATOR_THINKING")
+    critic_thinking: bool = Field(default=True, validation_alias="KNOWCODE_CRITIC_THINKING")
+    # Temperatures only apply when thinking is off. The generator gets a little
+    # randomness for more natural writing; 0.0 makes a non-thinking critic give
+    # the same draft the same score every time.
     generator_temperature: float = Field(
         default=0.3, ge=0.0, le=2.0, validation_alias="KNOWCODE_GENERATOR_TEMPERATURE"
     )
     critic_temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, validation_alias="KNOWCODE_CRITIC_TEMPERATURE"
     )
-    # Output length caps. Summaries need more room than the critic's short verdict.
+    # Output length caps. The critic's verdict is short, but its reasoning
+    # counts towards its cap, so it needs more room than the generator.
     generator_max_tokens: int = Field(
         default=1000, gt=0, validation_alias="KNOWCODE_GENERATOR_MAX_TOKENS"
     )
-    critic_max_tokens: int = Field(default=500, gt=0, validation_alias="KNOWCODE_CRITIC_MAX_TOKENS")
+    critic_max_tokens: int = Field(
+        default=8000, gt=0, validation_alias="KNOWCODE_CRITIC_MAX_TOKENS"
+    )
+
+    # --- Requests ------------------------------------------------------------
+    # How long to wait for one reply before treating it as a timeout. Critic
+    # calls in thinking mode have taken 20-80 seconds, so this is generous.
+    request_timeout_seconds: float = Field(
+        default=120.0, gt=0, validation_alias="KNOWCODE_REQUEST_TIMEOUT_SECONDS"
+    )
+    # Wait before the first technical retry; each later wait doubles (1s, 2s, 4s).
+    retry_base_delay_seconds: float = Field(
+        default=1.0, ge=0, validation_alias="KNOWCODE_RETRY_BASE_DELAY_SECONDS"
+    )
 
     # --- Retries and scoring -------------------------------------------------
     # Technical retries resend the exact same request after a network/API error
     # or an empty reply. They don't count against the quality retry budget.
+    # 3 retries means up to 4 attempts in total.
     max_technical_retries: int = Field(
         default=3, ge=0, validation_alias="KNOWCODE_MAX_TECHNICAL_RETRIES"
     )
@@ -73,6 +100,12 @@ class Settings(BaseSettings):
     # tokens (characters / 4). A class over the limit is split into its
     # methods; a single function over the limit is reported, not truncated.
     max_chunk_tokens: int = Field(default=6000, gt=0, validation_alias="KNOWCODE_MAX_CHUNK_TOKENS")
+
+    @property
+    def critic_model(self) -> str:
+        """The critic's model: DEEPSEEK_CRITIC_MODEL if set, else DEEPSEEK_MODEL."""
+        # An empty line in .env ("DEEPSEEK_CRITIC_MODEL=") counts as not set.
+        return self.deepseek_critic_model or self.deepseek_model
 
     def require_api_key(self) -> str:
         """Return the API key, or raise a clear error if it is not set."""

@@ -18,6 +18,11 @@ def clean_env(monkeypatch):
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_BASE_URL",
         "DEEPSEEK_MODEL",
+        "DEEPSEEK_CRITIC_MODEL",
+        "KNOWCODE_GENERATOR_THINKING",
+        "KNOWCODE_CRITIC_THINKING",
+        "KNOWCODE_REQUEST_TIMEOUT_SECONDS",
+        "KNOWCODE_RETRY_BASE_DELAY_SECONDS",
         "KNOWCODE_GENERATOR_TEMPERATURE",
         "KNOWCODE_CRITIC_TEMPERATURE",
         "KNOWCODE_GENERATOR_MAX_TOKENS",
@@ -35,12 +40,25 @@ def test_default_values():
     assert s.generator_temperature == 0.3
     assert s.critic_temperature == 0.0
     assert s.generator_max_tokens == 1000
-    assert s.critic_max_tokens == 500
+    assert s.critic_max_tokens == 8000
+    assert s.generator_thinking is False
+    assert s.critic_thinking is True
     assert s.max_technical_retries == 3
     assert s.max_quality_retries == 1
     assert s.pass_threshold == 4
     assert s.max_chunk_tokens == 6000
+    assert s.request_timeout_seconds == 120.0
+    assert s.retry_base_delay_seconds == 1.0
     assert s.deepseek_base_url == "https://api.deepseek.com"
+    assert s.deepseek_model == "deepseek-flash"
+
+
+def test_critic_uses_the_main_model_unless_one_is_set(monkeypatch):
+    assert Settings(_env_file=None).critic_model == "deepseek-flash"
+    monkeypatch.setenv("DEEPSEEK_CRITIC_MODEL", "")  # an empty line in .env
+    assert Settings(_env_file=None).critic_model == "deepseek-flash"
+    monkeypatch.setenv("DEEPSEEK_CRITIC_MODEL", "deepseek-v4-pro")
+    assert Settings(_env_file=None).critic_model == "deepseek-v4-pro"
 
 
 def test_environment_variables_override_defaults(monkeypatch):

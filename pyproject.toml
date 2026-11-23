@@ -25,6 +25,9 @@ packages = ["src/knowcode"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests marked "live" call the real API (and cost money); run them with: pytest -m live
+markers = ["live: calls the real DeepSeek API"]
+addopts = "-m 'not live'"
 
 [tool.ruff]
 line-length = 100
