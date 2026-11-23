@@ -131,7 +131,7 @@ def test_critic_request_uses_thinking_and_leaves_out_temperature():
     [sent] = server.requests
     assert sent["thinking"] == {"type": "enabled"}
     assert "temperature" not in sent  # ignored by the API in thinking mode
-    assert sent["max_tokens"] == 8000
+    assert sent["max_tokens"] == 12000
 
 
 def test_critic_with_thinking_off_sends_its_temperature():

@@ -40,7 +40,7 @@ def test_default_values():
     assert s.generator_temperature == 0.3
     assert s.critic_temperature == 0.0
     assert s.generator_max_tokens == 1000
-    assert s.critic_max_tokens == 8000
+    assert s.critic_max_tokens == 12000
     assert s.generator_thinking is False
     assert s.critic_thinking is True
     assert s.max_technical_retries == 3

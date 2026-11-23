@@ -65,7 +65,7 @@ class Settings(BaseSettings):
         default=1000, gt=0, validation_alias="KNOWCODE_GENERATOR_MAX_TOKENS"
     )
     critic_max_tokens: int = Field(
-        default=8000, gt=0, validation_alias="KNOWCODE_CRITIC_MAX_TOKENS"
+        default=12000, gt=0, validation_alias="KNOWCODE_CRITIC_MAX_TOKENS"
     )
 
     # --- Requests ------------------------------------------------------------
