@@ -1,0 +1,25 @@
+{
+  "name": "round_price",
+  "kind": "function",
+  "what_it_does": "Rounds a price up to the nearest cent. It multiplies the value by 100, rounds that number up to the next whole number, then divides by 100. It always rounds upward, never down, so any fraction of a cent pushes the result to the next cent.",
+  "highlights": {
+    "expected_behavior": [
+      "round_price(1.234) returns 1.24 because 123.4 rounds up to 124.",
+      "round_price(1.23) returns 1.23 because 123 is already a whole number.",
+      "round_price(0.001) returns 0.01 because 0.1 rounds up to 1."
+    ],
+    "boundary_values": [
+      "A value that is exactly a whole number of cents, such as 2.5, returns itself unchanged (2.5).",
+      "Zero returns 0.0 because 0 is already a whole number.",
+      "Negative values round toward zero: round_price(-1.234) returns -1.23, not -1.24."
+    ],
+    "failure_modes": [
+      "Passing a non-numeric value such as a string causes a TypeError from the multiplication.",
+      "Passing None causes a TypeError from the multiplication.",
+      "No explicit errors are raised by the function itself; it has no validation."
+    ]
+  },
+  "unclear_from_code": [
+    "Whether floating-point representation errors can make an exact-cent value round up unexpectedly (e.g. 1.005) is not addressed in the code."
+  ]
+}
