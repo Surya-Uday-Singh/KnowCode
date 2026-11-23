@@ -22,7 +22,6 @@ code wrongly. That is what the critic, and in the end human reviewers, are for.
 
 from __future__ import annotations
 
-import ast
 import builtins
 import json
 import keyword
@@ -386,52 +385,23 @@ def _bare_code_tokens(text: str) -> set[str]:
 
 
 def known_names(chunk: Chunk, imports: list[str], constants: list[str]) -> set[str]:
-    """Every name a summary of `chunk` may mention: names in the chunk's own
-    code, the file's imports and constants, and Python's built-in names
-    (a summary may rightly say a call raises TypeError even if the code
-    never spells it out)."""
+    """Every name a summary of `chunk` may mention.
+
+    That's every identifier-shaped word anywhere in the chunk's text, the
+    file's imports and constants, and Python's built-in names (a summary may
+    rightly say a call raises TypeError even if the code never spells it out).
+
+    "Anywhere in the text" deliberately includes docstrings, comments and
+    string values, not just variables and calls: a summary that mentions
+    `InputError` from a docstring, a "pass_mismatch" code stored in a string,
+    or a "response_format" dictionary key isn't inventing anything.
+    """
     names = set(dir(builtins)) | set(keyword.kwlist) | set(keyword.softkwlist)
     names |= set(_SUMMARY_FIELDS)
-    names |= _names_in_source(chunk.source)
-    names |= set(_IDENTIFIER.findall(chunk.name))  # "Cart.add" gives Cart and add
+    for text in [chunk.source, chunk.name, *imports, *constants]:
+        names |= set(_IDENTIFIER.findall(text))  # chunk.name "Cart.add" gives Cart, add
     if chunk.parent:
         names.add(chunk.parent)
-    for line in [*imports, *constants]:
-        names |= _names_in_source(line)
-    return names
-
-
-def _names_in_source(source: str) -> set[str]:
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        # Our own chunks always parse; this guards against odd context lines.
-        return set(_IDENTIFIER.findall(source))
-
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.Attribute):
-            names.add(node.attr)
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            names.add(node.name)
-        elif isinstance(node, ast.arg):
-            names.add(node.arg)
-        elif isinstance(node, ast.keyword) and node.arg:
-            names.add(node.arg)
-        elif isinstance(node, ast.alias):
-            names.update(node.name.split("."))
-            if node.asname:
-                names.add(node.asname)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.update(node.module.split("."))
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        elif isinstance(node, ast.Global | ast.Nonlocal):
-            names.update(node.names)
-        elif isinstance(node, ast.MatchAs | ast.MatchStar) and node.name:
-            names.add(node.name)
     return names
 
 

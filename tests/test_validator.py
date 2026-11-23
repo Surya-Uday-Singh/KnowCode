@@ -223,6 +223,64 @@ def test_known_names_cover_code_context_and_builtins(cart):
     assert "discount_rate" not in known
 
 
+# Code shaped like the real chunks where the first version of the name check
+# raised false alarms: names that only appear in a docstring, a comment, a
+# string value or a dictionary key.
+REAL_WORLD_CODE = '''\
+def send(payload, settings):
+    """Send the payload. Raises CodeSyntaxError (an InputError) on bad input."""
+    # DeepSeek needs JSON mode switched on for every request.
+    request = {"response_format": {"type": "json_object"}, "extra_body": payload}
+    if payload is None:
+        return Issue(code="pass_mismatch", message="content_filter")
+    return request
+'''
+
+
+def test_names_from_docstrings_comments_and_strings_are_known():
+    chunk = preprocess(REAL_WORLD_CODE, NO_LIMIT).chunks[0]
+    known = known_names(chunk, [], [])
+    assert {"CodeSyntaxError", "InputError", "DeepSeek"} <= known  # docstring, comment
+    assert {"pass_mismatch", "content_filter"} <= known  # string values
+    assert {"response_format", "json_object", "extra_body"} <= known  # dictionary keys
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        # Sentences from real DeepSeek drafts that were wrongly flagged.
+        "Invalid Python syntax causes CodeSyntaxError, which is an InputError.",
+        "Sets response_format to json_object, and extra_body to the payload.",
+        "A missing payload returns an Issue with code pass_mismatch.",
+        "Sends the request to the DeepSeek API.",
+    ],
+)
+def test_real_draft_sentences_using_names_from_the_code_pass(sentence):
+    chunk = preprocess(REAL_WORLD_CODE, NO_LIMIT).chunks[0]
+    data = summary_for(Role.QA, chunk_name="send")
+    data["highlights"]["failure_modes"] = [sentence]
+    result = validate_summary(json.dumps(data), chunk, Role.QA, [], [])
+    assert result.ok, result.errors
+
+
+def test_invented_setting_name_from_a_real_draft_is_still_caught():
+    # A real draft said the client "uses generator_model"; the setting is
+    # actually deepseek_model, so this name is invented.
+    result = preprocess_file(Path("src/knowcode/llm.py"))
+    chunk = chunk_named(result, "DeepSeekClient")
+    data = summary_for(Role.QA, chunk_name="DeepSeekClient", kind="class")
+    data["highlights"]["expected_behavior"] = [
+        "A generator call uses generator_model, generator_thinking and generator_max_tokens.",
+        "Every request sets response_format to json_object and extra_body thinking on or off.",
+    ]
+    check_result = validate_summary(
+        json.dumps(data), chunk, Role.QA, result.imports, result.constants
+    )
+    assert codes(check_result.errors) == ["unknown_name"]
+    assert "`generator_model`" in check_result.errors[0].message
+    assert "response_format" not in check_result.errors[0].message
+
+
 @pytest.mark.parametrize("role", [Role.DEVELOPER, Role.QA])
 def test_invented_names_are_errors_for_developer_and_qa(cart, role):
     item = "Stores the result in `self.discount_rate` and calls math.floor()."
