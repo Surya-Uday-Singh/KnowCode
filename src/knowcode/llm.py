@@ -405,12 +405,10 @@ def _main(argv: list[str]) -> int:
     try:
         client = DeepSeekClient()
         print(f"Summarizing {chunk.name} for role {role.value}…\n")
-        draft = client.complete(
-            build_generator_messages(chunk, role, result.imports, result.constants), "generator"
-        )
+        draft = client.complete(build_generator_messages(chunk, role, result.context), "generator")
         _print_reply(draft)
         verdict = client.complete(
-            build_critic_messages(chunk, role, draft.content, result.imports, result.constants),
+            build_critic_messages(chunk, role, draft.content, result.context),
             "critic",
         )
         _print_reply(verdict)

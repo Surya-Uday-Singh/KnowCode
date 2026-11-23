@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from knowcode.preprocessor import preprocess, preprocess_file
+from knowcode.preprocessor import FileContext, preprocess, preprocess_file
 from knowcode.prompts import EXAMPLE_CONSTANTS, EXAMPLE_SOURCE, ROLES, Role
 from knowcode.validator import (
     code_names,
@@ -45,9 +45,7 @@ def summary_for(role, chunk_name="round_price", kind="function", **changes):
 
 def check(cart, data, role=Role.DEVELOPER, chunk="round_price", **kwargs):
     text = data if isinstance(data, str) else json.dumps(data)
-    return validate_summary(
-        text, chunk_named(cart, chunk), role, cart.imports, cart.constants, **kwargs
-    )
+    return validate_summary(text, chunk_named(cart, chunk), role, cart.context, **kwargs)
 
 
 def codes(issues):
@@ -61,7 +59,7 @@ def codes(issues):
 def test_our_worked_examples_pass_with_no_errors_or_warnings(role):
     chunk = preprocess(EXAMPLE_SOURCE, NO_LIMIT).chunks[0]
     text = json.dumps(ROLES[role].example_summary)
-    result = validate_summary(text, chunk, role, [], EXAMPLE_CONSTANTS)
+    result = validate_summary(text, chunk, role, FileContext(constants=EXAMPLE_CONSTANTS))
     assert result.ok
     assert result.errors == [] and result.warnings == []
     assert result.summary.highlights == ROLES[role].example_summary["highlights"]
@@ -213,7 +211,7 @@ def test_code_names_finds_only_what_looks_like_code(text, names):
 
 
 def test_known_names_cover_code_context_and_builtins(cart):
-    known = known_names(chunk_named(cart, "Cart.add"), cart.imports, cart.constants)
+    known = known_names(chunk_named(cart, "Cart.add"), cart.context)
     # from the chunk's code
     assert {"add", "self", "item", "items", "append", "quantity", "len"} <= known
     # the method's class, the file's imports and constants
@@ -239,7 +237,7 @@ def send(payload, settings):
 
 def test_names_from_docstrings_comments_and_strings_are_known():
     chunk = preprocess(REAL_WORLD_CODE, NO_LIMIT).chunks[0]
-    known = known_names(chunk, [], [])
+    known = known_names(chunk, FileContext())
     assert {"CodeSyntaxError", "InputError", "DeepSeek"} <= known  # docstring, comment
     assert {"pass_mismatch", "content_filter"} <= known  # string values
     assert {"response_format", "json_object", "extra_body"} <= known  # dictionary keys
@@ -259,7 +257,7 @@ def test_real_draft_sentences_using_names_from_the_code_pass(sentence):
     chunk = preprocess(REAL_WORLD_CODE, NO_LIMIT).chunks[0]
     data = summary_for(Role.QA, chunk_name="send")
     data["highlights"]["failure_modes"] = [sentence]
-    result = validate_summary(json.dumps(data), chunk, Role.QA, [], [])
+    result = validate_summary(json.dumps(data), chunk, Role.QA, FileContext())
     assert result.ok, result.errors
 
 
@@ -273,9 +271,7 @@ def test_invented_setting_name_from_a_real_draft_is_still_caught():
         "A generator call uses generator_model, generator_thinking and generator_max_tokens.",
         "Every request sets response_format to json_object and extra_body thinking on or off.",
     ]
-    check_result = validate_summary(
-        json.dumps(data), chunk, Role.QA, result.imports, result.constants
-    )
+    check_result = validate_summary(json.dumps(data), chunk, Role.QA, result.context)
     assert codes(check_result.errors) == ["unknown_name"]
     assert "`generator_model`" in check_result.errors[0].message
     assert "response_format" not in check_result.errors[0].message
@@ -467,3 +463,16 @@ def test_real_critic_verdict_from_a_live_call_is_accepted():
     result = validate_verdict(text, pass_threshold=4)
     assert result.verdict.score == 3 and not result.verdict.passed
     assert result.warnings == []
+
+
+def test_names_from_the_files_other_definitions_are_known(cart):
+    # checkout_total isn't in CartItem's code; it's only in the outline of
+    # Cart, which the model is shown alongside CartItem.
+    data = summary_for(Role.DEVELOPER, chunk_name="CartItem", kind="class")
+    data["highlights"]["dependencies"] = ["Its `total` is used by `Cart.checkout_total`."]
+    text = json.dumps(data)
+    chunk = chunk_named(cart, "CartItem")
+    assert validate_summary(text, chunk, Role.DEVELOPER, cart.context).ok
+    without_outlines = FileContext(imports=cart.imports, constants=cart.constants)
+    result = validate_summary(text, chunk, Role.DEVELOPER, without_outlines)
+    assert "`checkout_total`" in result.errors[0].message

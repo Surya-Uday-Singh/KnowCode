@@ -354,3 +354,143 @@ def test_script_statement_too_large_on_its_own_is_reported():
     [failure] = result.failures
     assert failure.kind == "script"
     assert failure.reason == "too_large"
+
+
+# --- Outlines of the file's other definitions ---------------------------------
+
+
+def test_sample_file_outlines():
+    result = preprocess_file(SAMPLE, NO_LIMIT)
+    assert [d.outline for d in result.definitions] == [
+        "def round_price(value: float) -> float — Round a price up to the nearest cent.",
+        "@dataclass class CartItem — fields: name: str, unit_price: float, quantity: int = 1"
+        " · methods: total() -> float",
+        "class Cart — methods: add(item: CartItem) -> None, subtotal (property),"
+        " checkout_total() -> float",
+        "async def export_cart(cart: Cart) -> str",
+    ]
+
+
+def test_outlines_show_decorators_bases_and_method_kinds():
+    source = code(
+        '''
+        import functools
+
+        @functools.lru_cache
+        def cached(n: int) -> int:
+            return n
+
+        class Shape(Base, metaclass=Meta):
+            """A shape.
+
+            More detail that isn't shown."""
+            def __init__(self, size):
+                self.size = size
+            def __repr__(self):
+                return "Shape"
+            @staticmethod
+            def unit(n):
+                return n
+            @classmethod
+            def make(cls, size):
+                return cls(size)
+            async def draw(self, *, color="red"):
+                pass
+
+        class Empty:
+            def __init__(self):
+                pass
+        '''
+    )
+    outlines = [d.outline for d in preprocess(source, NO_LIMIT).definitions]
+    assert outlines == [
+        "@functools.lru_cache def cached(n: int) -> int",
+        "class Shape(Base, metaclass=Meta) — A shape. · methods: __init__(size), unit(n),"
+        " make(size), async draw(*, color='red')",
+        "class Empty",
+    ]
+
+
+def test_outline_joins_a_wrapped_docstring_and_shortens_long_ones():
+    long_doc = "word " * 60
+    source = code(
+        f'''
+        def wrapped():
+            """First sentence that wraps
+            onto a second line.
+
+            Second paragraph."""
+
+        def long():
+            """{long_doc}"""
+        '''
+    )
+    wrapped, long = preprocess(source, NO_LIMIT).definitions
+    assert wrapped.outline == "def wrapped() — First sentence that wraps onto a second line."
+    assert long.outline.endswith("…")
+    assert len(long.outline) <= len("def long() — ") + 150
+
+
+def test_very_long_outline_is_cut_at_300_characters():
+    fields = "\n".join(f"    field_{i}: int = {i}" for i in range(40))
+    result = preprocess(f"class Big:\n{fields}\n", NO_LIMIT)
+    [big] = result.definitions
+    assert len(big.outline) == 300 and big.outline.endswith("…")
+
+
+def test_only_top_level_definitions_are_outlined():
+    source = code(
+        """
+        def outer():
+            def inner():
+                pass
+            return inner
+
+        if __name__ == "__main__":
+            def hidden():
+                pass
+            outer()
+        """
+    )
+    assert [d.name for d in preprocess(source, NO_LIMIT).definitions] == ["outer"]
+
+
+def test_too_large_definitions_are_still_outlined():
+    source = "def small():\n    return 1\n\ndef huge():\n" + "".join(
+        f"    x{i} = {i}\n" for i in range(200)
+    )
+    result = preprocess(source, 200)
+    assert [f.name for f in result.failures] == ["huge"]
+    assert [d.name for d in result.definitions] == ["small", "huge"]
+
+
+def test_each_chunk_sees_every_other_definition_but_not_its_own():
+    result = preprocess_file(SAMPLE, NO_LIMIT)
+    chunk = next(c for c in result.chunks if c.name == "CartItem")
+    outlines = result.context.outlines_for(chunk)
+    assert [o.split(" — ")[0] for o in outlines] == [
+        "def round_price(value: float) -> float",
+        "class Cart",
+        "async def export_cart(cart: Cart) -> str",
+    ]
+
+
+def test_a_method_split_out_of_its_class_still_sees_the_class_outline():
+    result = preprocess_file(SAMPLE, 100)
+    chunk = next(c for c in result.chunks if c.name == "Cart.add")
+    outlines = result.context.outlines_for(chunk)
+    assert any(o.startswith("class Cart — methods: add(") for o in outlines)
+    assert len(outlines) == 4
+
+
+def test_definitions_context_is_capped_with_a_count_of_the_rest():
+    source = "".join(
+        f'def function_number_{i}(argument_{i}: int) -> int:\n    """Does thing {i}."""\n\n'
+        for i in range(60)
+    )
+    result = preprocess(source, NO_LIMIT)
+    outlines = result.context.outlines_for(result.chunks[0])
+    assert outlines[-1].startswith("…(+") and outlines[-1].endswith(" more)")
+    assert sum(len(o) + 1 for o in outlines[:-1]) <= 1500
+    shown = len(outlines) - 1
+    assert outlines[-1] == f"…(+{59 - shown} more)"

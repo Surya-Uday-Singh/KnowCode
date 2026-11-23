@@ -23,9 +23,7 @@ def test_round_price_qa_summary_ends_with_a_kept_summary():
     result = preprocess_file(SAMPLE)
     chunk = next(c for c in result.chunks if c.name == "round_price")
 
-    outcome = summarize_chunk(
-        chunk, Role.QA, result.imports, result.constants, DeepSeekClient(settings), settings
-    )
+    outcome = summarize_chunk(chunk, Role.QA, result.context, DeepSeekClient(settings), settings)
 
     assert outcome.status in {"passed", "passed_with_rule_errors", "below_threshold"}
     assert outcome.summary is not None and outcome.summary.name == "round_price"

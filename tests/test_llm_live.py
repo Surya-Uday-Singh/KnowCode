@@ -33,9 +33,7 @@ def test_generator_then_critic_return_json(client):
     result = preprocess_file(SAMPLE)
     chunk = next(c for c in result.chunks if c.name == "round_price")
 
-    draft = client.complete(
-        build_generator_messages(chunk, Role.QA, result.imports, result.constants), "generator"
-    )
+    draft = client.complete(build_generator_messages(chunk, Role.QA, result.context), "generator")
     assert not draft.truncated
     summary = json.loads(draft.content)
     assert summary["name"] == "round_price"
@@ -44,7 +42,7 @@ def test_generator_then_critic_return_json(client):
     )
 
     verdict_reply = client.complete(
-        build_critic_messages(chunk, Role.QA, draft.content, result.imports, result.constants),
+        build_critic_messages(chunk, Role.QA, draft.content, result.context),
         "critic",
     )
     assert not verdict_reply.truncated

@@ -41,7 +41,7 @@ from knowcode.llm import (
     LLMError,
     LLMReply,
 )
-from knowcode.preprocessor import Chunk, PreprocessResult
+from knowcode.preprocessor import Chunk, FileContext, PreprocessResult
 from knowcode.prompts import (
     Message,
     ProblemSource,
@@ -190,8 +190,7 @@ class ChunkOutcome(BaseModel):
 def summarize_chunk(
     chunk: Chunk,
     role: Role,
-    imports: list[str],
-    constants: list[str],
+    context: FileContext,
     client: LLMClient,
     settings: Settings | None = None,
 ) -> ChunkOutcome:
@@ -204,7 +203,7 @@ def summarize_chunk(
     threshold = settings.pass_threshold
     retries_left = settings.max_quality_retries
     drafts: list[Draft] = []
-    messages = build_generator_messages(chunk, role, imports, constants)
+    messages = build_generator_messages(chunk, role, context)
     reason: ProblemSource | None = None
 
     while True:
@@ -221,19 +220,17 @@ def summarize_chunk(
             break  # technical retries are already used up; keep any earlier draft
 
         draft.check = validate_summary(
-            draft.reply.content, chunk, role, imports, constants, draft.reply.truncated
+            draft.reply.content, chunk, role, context, draft.reply.truncated
         )
         if draft.usable:
-            _review(draft, chunk, role, imports, constants, client, settings)
+            _review(draft, chunk, role, context, client, settings)
 
         feedback = _retry_feedback(draft, threshold)
         if feedback is None or retries_left == 0:
             break
         problems, reason = feedback
         retries_left -= 1
-        messages = build_retry_messages(
-            chunk, role, imports, constants, draft.reply.content, problems, reason
-        )
+        messages = build_retry_messages(chunk, role, context, draft.reply.content, problems, reason)
 
     return _outcome(chunk, role, drafts, threshold)
 
@@ -257,9 +254,7 @@ def summarize_file(
     outcomes: list[ChunkOutcome] = []
     for done, chunk in enumerate(result.chunks, 1):
         try:
-            outcome = summarize_chunk(
-                chunk, role, result.imports, result.constants, client, settings
-            )
+            outcome = summarize_chunk(chunk, role, result.context, client, settings)
         except LLMError as error:
             if error.stops_run:
                 raise
@@ -295,15 +290,14 @@ def _review(
     draft: Draft,
     chunk: Chunk,
     role: Role,
-    imports: list[str],
-    constants: list[str],
+    context: FileContext,
     client: LLMClient,
     settings: Settings,
 ) -> None:
     """Have the critic read the draft `critic_runs` times and combine the scores."""
     assert draft.reply is not None
     draft.critic_messages = build_critic_messages(
-        chunk, role, draft.reply.content, imports, constants, settings.pass_threshold
+        chunk, role, draft.reply.content, context, settings.pass_threshold
     )
     draft.reads = [
         _read(draft.critic_messages, client, settings.pass_threshold)

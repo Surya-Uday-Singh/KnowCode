@@ -30,7 +30,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from knowcode.preprocessor import Chunk
+from knowcode.preprocessor import Chunk, FileContext
 from knowcode.prompts import ROLES, Role
 
 # Length guidelines given to the generator. Breaking them is only a warning.
@@ -121,8 +121,7 @@ def validate_summary(
     text: str,
     chunk: Chunk,
     role: Role,
-    imports: list[str],
-    constants: list[str],
+    context: FileContext,
     truncated: bool = False,
 ) -> SummaryCheck:
     """Check a generator reply for `chunk`, written for `role`.
@@ -154,7 +153,7 @@ def validate_summary(
     _check_name_and_kind(summary, chunk, errors)
     reader_text = _reader_text(summary)
     if ROLES[role].uses_code_names:
-        _check_names_exist(reader_text, chunk, imports, constants, errors)
+        _check_names_exist(reader_text, chunk, context, errors)
     else:
         _check_no_jargon(reader_text, errors)
     _check_lengths(summary, warnings)
@@ -250,11 +249,10 @@ def _check_name_and_kind(summary: Summary, chunk: Chunk, errors: list[Issue]) ->
 def _check_names_exist(
     texts: list[str],
     chunk: Chunk,
-    imports: list[str],
-    constants: list[str],
+    context: FileContext,
     errors: list[Issue],
 ) -> None:
-    known = known_names(chunk, imports, constants)
+    known = known_names(chunk, context)
     unknown = sorted({name for text in texts for name in code_names(text)} - known)
     if unknown:
         errors.append(
@@ -384,12 +382,15 @@ def _bare_code_tokens(text: str) -> set[str]:
     return tokens
 
 
-def known_names(chunk: Chunk, imports: list[str], constants: list[str]) -> set[str]:
+def known_names(chunk: Chunk, context: FileContext) -> set[str]:
     """Every name a summary of `chunk` may mention.
 
     That's every identifier-shaped word anywhere in the chunk's text, the
-    file's imports and constants, and Python's built-in names (a summary may
-    rightly say a call raises TypeError even if the code never spells it out).
+    file's imports and constants, the outlines of the file's other
+    definitions (the model is shown those, so `round_price` is a fair name in
+    a summary of a class that calls it), and Python's built-in names (a
+    summary may rightly say a call raises TypeError even if the code never
+    spells it out).
 
     "Anywhere in the text" deliberately includes docstrings, comments and
     string values, not just variables and calls: a summary that mentions
@@ -398,7 +399,8 @@ def known_names(chunk: Chunk, imports: list[str], constants: list[str]) -> set[s
     """
     names = set(dir(builtins)) | set(keyword.kwlist) | set(keyword.softkwlist)
     names |= set(_SUMMARY_FIELDS)
-    for text in [chunk.source, chunk.name, *imports, *constants]:
+    outlines = [definition.outline for definition in context.definitions]
+    for text in [chunk.source, chunk.name, *context.imports, *context.constants, *outlines]:
         names |= set(_IDENTIFIER.findall(text))  # chunk.name "Cart.add" gives Cart, add
     if chunk.parent:
         names.add(chunk.parent)

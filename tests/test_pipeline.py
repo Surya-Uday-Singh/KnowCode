@@ -71,9 +71,7 @@ def verdict(score, critique=""):
 def run(cart, script, role=Role.QA, chunk="round_price", **config):
     client = FakeLLMClient(script)
     target = next(c for c in cart.chunks if c.name == chunk)
-    outcome = summarize_chunk(
-        target, role, cart.imports, cart.constants, client, settings(**config)
-    )
+    outcome = summarize_chunk(target, role, cart.context, client, settings(**config))
     assert client.remaining == 0, "the script had unused replies"
     return outcome, client
 
@@ -395,7 +393,7 @@ def test_setup_errors_stop_the_run(cart, position):
     client = FakeLLMClient(script)
     chunk = cart.chunks[0]
     with pytest.raises(LLMSetupError):
-        summarize_chunk(chunk, Role.QA, cart.imports, cart.constants, client, settings())
+        summarize_chunk(chunk, Role.QA, cart.context, client, settings())
 
 
 # --- Whole files ---------------------------------------------------------------

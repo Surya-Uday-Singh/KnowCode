@@ -27,6 +27,7 @@ Run it on a file to see what it produces:
 from __future__ import annotations
 
 import ast
+import copy
 import math
 import sys
 import textwrap
@@ -43,6 +44,12 @@ CHARS_PER_TOKEN = 4
 # Constants longer than this aren't copied into the shared file context,
 # because that context is repeated in every prompt for the file.
 MAX_CONSTANT_CONTEXT_CHARS = 200
+
+# Limits for the outlines of the file's other definitions, also repeated in
+# every prompt: one outline line, and all outlines sent with one chunk.
+MAX_OUTLINE_CHARS = 300
+MAX_DEFINITIONS_CONTEXT_CHARS = 1500
+MAX_DOC_SUMMARY_CHARS = 150
 
 # A method split out of a class is still kind "function"; its `parent` field
 # records which class it came from. "script" is code outside any definition.
@@ -88,15 +95,66 @@ class ChunkFailure(BaseModel):
     estimated_tokens: int
 
 
+class Definition(BaseModel):
+    """A one-line outline of a top-level function or class, built from its
+    code: signature (or a class's fields and methods) and the first line of
+    its docstring. No summary is generated; this is read straight from the code."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    # e.g. "def round_price(value: float) -> float — Round a price up to the nearest cent."
+    outline: str
+
+
+class FileContext(BaseModel):
+    """What the model is told about the rest of the file alongside one chunk.
+    Each chunk is summarized on its own, so without this it can't know that,
+    say, a helper it calls is defined a few lines above."""
+
+    model_config = ConfigDict(frozen=True)
+
+    imports: list[str] = []
+    constants: list[str] = []
+    definitions: list[Definition] = []
+
+    def outlines_for(self, chunk: Chunk) -> list[str]:
+        """Outlines of the file's other definitions, for `chunk`.
+
+        The chunk's own definition is left out (its full code is already in
+        the prompt), but a method split out of a class keeps its class's
+        outline, which lists its sibling methods. The list is capped so the
+        context stays small; anything cut off is counted in a last line.
+        """
+        own = chunk.name if chunk.parent is None else None
+        others = [d.outline for d in self.definitions if d.name != own]
+        shown: list[str] = []
+        used = 0
+        for index, outline in enumerate(others):
+            if shown and used + len(outline) > MAX_DEFINITIONS_CONTEXT_CHARS:
+                shown.append(f"…(+{len(others) - index} more)")
+                break
+            shown.append(outline)
+            used += len(outline) + 1
+        return shown
+
+
 class PreprocessResult(BaseModel):
     """Everything later steps need from one source file."""
 
     # File context, sent to the model with every chunk from this file.
     imports: list[str]  # import statements exactly as written
     constants: list[str]  # short module-level constant assignments, e.g. "MAX_ROWS = 1000"
+    definitions: list[Definition] = []  # outline of every top-level function and class
 
     chunks: list[Chunk]  # in the order they appear in the file
     failures: list[ChunkFailure]  # pieces we refused to send (e.g. too large)
+
+    @property
+    def context(self) -> FileContext:
+        return FileContext(
+            imports=self.imports, constants=self.constants, definitions=self.definitions
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +215,7 @@ def preprocess(source: str, max_chunk_tokens: int | None = None) -> PreprocessRe
     lines = source.splitlines(keepends=True)
 
     imports = _collect_imports(tree, source)
+    definitions = [_definition(node) for node in tree.body if isinstance(node, _DEF_NODES)]
     constants: list[str] = []
     chunks: list[Chunk] = []
     failures: list[ChunkFailure] = []
@@ -200,7 +259,13 @@ def preprocess(source: str, max_chunk_tokens: int | None = None) -> PreprocessRe
         constants.clear()
         _chunk_script(tree.body, lines, max_chunk_tokens, chunks, failures)
 
-    return PreprocessResult(imports=imports, constants=constants, chunks=chunks, failures=failures)
+    return PreprocessResult(
+        imports=imports,
+        constants=constants,
+        definitions=definitions,
+        chunks=chunks,
+        failures=failures,
+    )
 
 
 def preprocess_file(path: str | Path, max_chunk_tokens: int | None = None) -> PreprocessResult:
@@ -217,6 +282,103 @@ def preprocess_file(path: str | Path, max_chunk_tokens: int | None = None) -> Pr
         # SyntaxError here means an invalid encoding declaration, not bad code.
         raise InputError(f"Could not read {path} as Python source text: {exc}") from exc
     return preprocess(source, max_chunk_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Outlines of the file's definitions
+# ---------------------------------------------------------------------------
+
+
+def _definition(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> Definition:
+    outline = _outline(node)
+    if len(outline) > MAX_OUTLINE_CHARS:
+        outline = outline[: MAX_OUTLINE_CHARS - 1] + "…"
+    return Definition(name=node.name, outline=outline)
+
+
+def _outline(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+    """One line describing a definition, e.g.
+    "def round_price(value: float) -> float — Round a price up to the nearest cent."
+    "@dataclass class CartItem — fields: name: str, quantity: int = 1; methods: total() -> float"
+    """
+    details = []
+    doc = _doc_summary(node)
+    if doc:
+        details.append(doc)
+
+    if isinstance(node, ast.ClassDef):
+        head = f"{_decorators(node)}class {node.name}"
+        bases = [ast.unparse(b) for b in [*node.bases, *node.keywords]]
+        if bases:
+            head += f"({', '.join(bases)})"
+        fields = [
+            ast.unparse(item)
+            for item in node.body
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+        ]
+        if fields:
+            details.append("fields: " + ", ".join(fields))
+        methods = [
+            _method_outline(item)
+            for item in node.body
+            if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef) and _is_shown_method(item)
+        ]
+        if methods:
+            details.append("methods: " + ", ".join(methods))
+    else:
+        head = _decorators(node) + _signature(node, keyword=True)
+
+    return head + (" — " + " · ".join(details) if details else "")
+
+
+def _doc_summary(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+    """The first paragraph of the docstring on one line, shortened if long.
+    Docstrings often wrap their first sentence over several lines."""
+    doc = ast.get_docstring(node)
+    if not doc or not doc.strip():
+        return ""
+    paragraph = doc.strip().split("\n\n")[0]
+    text = " ".join(paragraph.split())
+    return text if len(text) <= MAX_DOC_SUMMARY_CHARS else text[: MAX_DOC_SUMMARY_CHARS - 1] + "…"
+
+
+def _signature(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, keyword: bool, drop_first: bool = False
+) -> str:
+    args = node.args
+    if drop_first:
+        # Leave out `self` / `cls`; the reader knows a method gets its object.
+        args = copy.copy(args)
+        if args.posonlyargs:
+            args.posonlyargs = args.posonlyargs[1:]
+        elif args.args:
+            args.args = args.args[1:]
+    returns = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+    is_async = isinstance(node, ast.AsyncFunctionDef)
+    prefix = ("async def " if is_async else "def ") if keyword else ("async " if is_async else "")
+    return f"{prefix}{node.name}({ast.unparse(args)}){returns}"
+
+
+def _method_outline(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    decorators = {ast.unparse(d) for d in node.decorator_list}
+    if decorators & {"property", "cached_property", "functools.cached_property"}:
+        return f"{node.name} (property)"
+    return _signature(node, keyword=False, drop_first="staticmethod" not in decorators)
+
+
+def _is_shown_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Special methods aren't called by name, so they're left out of a class's
+    outline, except an __init__ that takes arguments (how the class is created)."""
+    if not (node.name.startswith("__") and node.name.endswith("__")):
+        return True
+    has_arguments = len(node.args.posonlyargs) + len(node.args.args) > 1 or bool(
+        node.args.vararg or node.args.kwonlyargs or node.args.kwarg
+    )
+    return node.name == "__init__" and has_arguments
+
+
+def _decorators(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+    return "".join(f"@{ast.unparse(d)} " for d in node.decorator_list)
 
 
 # ---------------------------------------------------------------------------

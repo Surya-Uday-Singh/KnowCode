@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from knowcode.preprocessor import preprocess_file
+from knowcode.preprocessor import FileContext, preprocess_file
 from knowcode.prompts import (
     BE_SPECIFIC_IN_BUSINESS_TERMS,
     BE_SPECIFIC_WITH_NAMES,
@@ -17,6 +17,8 @@ from knowcode.prompts import (
     NO_INVENTED_NAMES,
     ONLY_FROM_CODE,
     OTHER_RULES,
+    REFERENCE_RULE_IN_BUSINESS_TERMS,
+    REFERENCE_RULE_WITH_NAMES,
     ROLES,
     Role,
     build_critic_messages,
@@ -45,14 +47,12 @@ def chunk_named(sample, name):
 
 
 def generator(sample, name, role):
-    return build_generator_messages(
-        chunk_named(sample, name), role, sample.imports, sample.constants
-    )
+    return build_generator_messages(chunk_named(sample, name), role, sample.context)
 
 
 def critic(sample, name, role, draft='{"name": "x"}'):
     return build_critic_messages(
-        chunk_named(sample, name), role, draft, sample.imports, sample.constants, pass_threshold=4
+        chunk_named(sample, name), role, draft, sample.context, pass_threshold=4
     )
 
 
@@ -131,13 +131,19 @@ def test_developer_and_qa_keep_the_name_rules(sample, role):
 
 
 @pytest.mark.parametrize("role", ALL_ROLES)
-def test_every_role_gets_seven_rules_in_the_same_order(sample, role):
+def test_every_role_gets_eight_rules_in_the_same_order(sample, role):
     system = generator(sample, "round_price", role)[0]["content"]
     rules = system.split("## Rules for all roles\n", 1)[1].split("\n\n## Output format", 1)[0]
     lines = rules.splitlines()
-    assert len(lines) == 7
+    assert len(lines) == 8
     assert lines[0] == f"- {ONLY_FROM_CODE}"
-    assert lines[3:] == [f"- {rule}" for rule in OTHER_RULES]
+    reference = (
+        REFERENCE_RULE_WITH_NAMES
+        if ROLES[role].uses_code_names
+        else REFERENCE_RULE_IN_BUSINESS_TERMS
+    )
+    assert lines[1] == f"- {reference}"
+    assert lines[4:] == [f"- {rule}" for rule in OTHER_RULES]
 
 
 def test_generator_user_message_has_the_code_and_file_context(sample):
@@ -150,7 +156,7 @@ def test_generator_user_message_has_the_code_and_file_context(sample):
 
 def test_empty_file_context_is_shown_as_none(sample):
     chunk = chunk_named(sample, "round_price")
-    user = build_generator_messages(chunk, Role.DEVELOPER, [], [])[1]["content"]
+    user = build_generator_messages(chunk, Role.DEVELOPER, FileContext())[1]["content"]
     assert "File imports (for reference only):\n(none)" in user
     assert "File constants (for reference only):\n(none)" in user
 
@@ -174,7 +180,7 @@ def test_script_chunk_is_described_as_script_code(tmp_path):
     path.write_text("import sys\n\nfor arg in sys.argv[1:]:\n    print(arg.upper())\n")
     result = preprocess_file(path, NO_LIMIT)
     [chunk] = result.chunks
-    messages = build_generator_messages(chunk, Role.QA, result.imports, result.constants)
+    messages = build_generator_messages(chunk, Role.QA, result.context)
     assert "Python script code (module-level statements, lines" in messages[0]["content"]
     assert '"kind": "script"' in messages[0]["content"]
     assert "Python script code to summarize:" in messages[1]["content"]
@@ -182,7 +188,7 @@ def test_script_chunk_is_described_as_script_code(tmp_path):
 
 def test_chunk_name_with_quotes_still_gives_valid_json_in_the_schema(sample):
     chunk = chunk_named(sample, "round_price").model_copy(update={"name": 'weird"name'})
-    system = build_generator_messages(chunk, Role.DEVELOPER, [], [])[0]["content"]
+    system = build_generator_messages(chunk, Role.DEVELOPER, FileContext())[0]["content"]
     assert '"name": "weird\\"name"' in system
 
 
@@ -274,7 +280,9 @@ def test_critic_user_message_has_code_context_and_draft(sample):
 
 def test_critic_pass_rule_uses_the_threshold(sample):
     chunk = chunk_named(sample, "round_price")
-    system = build_critic_messages(chunk, Role.QA, "{}", [], [], pass_threshold=3)[0]["content"]
+    system = build_critic_messages(chunk, Role.QA, "{}", FileContext(), pass_threshold=3)[0][
+        "content"
+    ]
     assert '"pass" must be true exactly when the score is 3 or higher.' in system
 
 
@@ -285,7 +293,7 @@ def test_critic_threshold_defaults_to_settings(sample, monkeypatch):
     get_settings.cache_clear()
     try:
         chunk = chunk_named(sample, "round_price")
-        system = build_critic_messages(chunk, Role.QA, "{}", [], [])[0]["content"]
+        system = build_critic_messages(chunk, Role.QA, "{}", FileContext())[0]["content"]
         assert "the score is 5 or higher" in system
     finally:
         get_settings.cache_clear()
@@ -305,12 +313,11 @@ def test_critic_has_a_passing_and_a_failing_example(sample, role):
 
 def test_retry_is_the_generator_prompt_plus_draft_and_critique(sample):
     chunk = chunk_named(sample, "Cart.add")
-    first = build_generator_messages(chunk, Role.QA, sample.imports, sample.constants)
+    first = build_generator_messages(chunk, Role.QA, sample.context)
     retry = build_retry_messages(
         chunk,
         Role.QA,
-        sample.imports,
-        sample.constants,
+        sample.context,
         previous_draft='{"name": "Cart.add"}',
         problems="1. boundary_values is generic.",
     )
@@ -326,7 +333,7 @@ def test_retry_is_the_generator_prompt_plus_draft_and_critique(sample):
 def test_retry_with_problems_from_both_sources_says_so(sample):
     chunk = chunk_named(sample, "round_price")
     retry = build_retry_messages(
-        chunk, Role.QA, [], [], "{}", "From the reviewer:\n1. a", found_by="both"
+        chunk, Role.QA, FileContext(), "{}", "From the reviewer:\n1. a", found_by="both"
     )
     user = retry[1]["content"]
     assert "A reviewer and an automatic check found these problems:\nFrom the reviewer:" in user
@@ -337,8 +344,7 @@ def test_retry_after_a_validator_error_says_so(sample):
     retry = build_retry_messages(
         chunk,
         Role.PM,
-        [],
-        [],
+        FileContext(),
         previous_draft='{"name": "round_price", "what_it_does": "Rounds',
         problems="The reply is not valid JSON: it ends in the middle of a string.",
     )
@@ -347,8 +353,7 @@ def test_retry_after_a_validator_error_says_so(sample):
     retry = build_retry_messages(
         chunk,
         Role.PM,
-        [],
-        [],
+        FileContext(),
         previous_draft='{"name": "round_price", "what_it_does": "Rounds',
         problems="The reply is not valid JSON: it ends in the middle of a string.",
         found_by="validator",
@@ -363,6 +368,53 @@ def test_retry_after_a_validator_error_says_so(sample):
 def test_building_prompts_does_not_change_the_chunk(sample):
     chunk = chunk_named(sample, "Cart.add")
     before = chunk.model_dump()
-    build_retry_messages(chunk, Role.DEVELOPER, [], [], "{}", "problem")
-    build_critic_messages(chunk, Role.DEVELOPER, "{}", [], [], pass_threshold=4)
+    build_retry_messages(chunk, Role.DEVELOPER, FileContext(), "{}", "problem")
+    build_critic_messages(chunk, Role.DEVELOPER, "{}", FileContext(), pass_threshold=4)
     assert chunk.model_dump() == before
+
+
+# --- Other definitions in the file -------------------------------------------------
+
+
+DEFINITIONS_HEADER = "Other definitions in this file (for reference only; their code is not shown):"
+
+
+def test_generator_sees_the_other_definitions_in_the_file_but_not_its_own(sample):
+    user = generator(sample, "CartItem", Role.QA)[1]["content"]
+    block = user.split(DEFINITIONS_HEADER + "\n", 1)[1].split("\n\n", 1)[0]
+    assert block.splitlines()[0] == (
+        "def round_price(value: float) -> float — Round a price up to the nearest cent."
+    )
+    assert "class Cart — methods: add(item: CartItem) -> None" in block
+    assert "class CartItem" not in block
+    # the reference sections come before the code
+    assert user.index(DEFINITIONS_HEADER) < user.index("Python class to summarize:")
+
+
+def test_no_other_definitions_shows_none(sample):
+    chunk = chunk_named(sample, "round_price")
+    user = build_generator_messages(chunk, Role.QA, FileContext())[1]["content"]
+    assert f"{DEFINITIONS_HEADER}\n(none)" in user
+
+
+def test_critic_sees_the_definitions_and_is_told_missing_claims_are_errors(sample):
+    system, user = (m["content"] for m in critic(sample, "CartItem", Role.QA))
+    assert DEFINITIONS_HEADER in user and "def round_price(value: float)" in user
+    assert "a claim that one of them is missing or undefined is an error" in system
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_worked_examples_show_the_definitions_block_as_none(sample, role):
+    for system in (
+        generator(sample, "round_price", role)[0],
+        critic(sample, "round_price", role)[0],
+    ):
+        assert f"{DEFINITIONS_HEADER}\n(none)" in system["content"]
+
+
+def test_rule_one_covers_the_reference_sections(sample):
+    system = generator(sample, "round_price", Role.DEVELOPER)[0]["content"]
+    assert "Use only information found in the code and the reference sections" in system
+    assert "You may say this code uses them" in system
+    pm_system = generator(sample, "round_price", Role.PM)[0]["content"]
+    assert "You may say this code uses them" not in pm_system

@@ -29,7 +29,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict
 
-from knowcode.preprocessor import Chunk
+from knowcode.preprocessor import Chunk, FileContext
 
 
 class Role(StrEnum):
@@ -345,7 +345,20 @@ BE_SPECIFIC_IN_BUSINESS_TERMS = (
     'business terms. Avoid generic statements such as "handles errors" or "processes data".'
 )
 ONLY_FROM_CODE = (
-    "Use only information found in the code. Do not guess about code that is not shown."
+    "Use only information found in the code and the reference sections above it. Do not guess "
+    "about code that is not shown."
+)
+# The user message lists the file's other definitions (their outlines, not
+# their code). Without this rule the model may decide a helper defined
+# elsewhere in the file doesn't exist, or describe its internals.
+REFERENCE_RULE_WITH_NAMES = (
+    'Names listed under "Other definitions in this file" exist in the file even though their '
+    "code is not shown. You may say this code uses them, but do not describe how they work "
+    "inside beyond what their outline says."
+)
+REFERENCE_RULE_IN_BUSINESS_TERMS = (
+    'Things listed under "Other definitions in this file" exist in the file even though their '
+    "code is not shown. Do not describe how they work inside beyond what their outline says."
 )
 OTHER_RULES = (
     "If something important cannot be determined from the code, put it in "
@@ -377,13 +390,12 @@ _PROBLEM_HEADERS: dict[ProblemSource, str] = {
 # ---------------------------------------------------------------------------
 
 
-def build_generator_messages(
-    chunk: Chunk, role: Role, imports: list[str], constants: list[str]
-) -> list[Message]:
-    """Messages asking the model to summarize `chunk` for `role`."""
+def build_generator_messages(chunk: Chunk, role: Role, context: FileContext) -> list[Message]:
+    """Messages asking the model to summarize `chunk` for `role`. `context` is
+    what the model is told about the rest of the file."""
     return [
         {"role": "system", "content": _generator_system(chunk, ROLES[role])},
-        {"role": "user", "content": _generator_user(chunk, imports, constants)},
+        {"role": "user", "content": _generator_user(chunk, context)},
     ]
 
 
@@ -391,8 +403,7 @@ def build_critic_messages(
     chunk: Chunk,
     role: Role,
     draft: str,
-    imports: list[str],
-    constants: list[str],
+    context: FileContext,
     pass_threshold: int | None = None,
 ) -> list[Message]:
     """Messages asking the model to score `draft` (the generator's raw reply).
@@ -407,7 +418,7 @@ def build_critic_messages(
     spec = ROLES[role]
     user = "\n\n".join(
         [
-            _file_context(imports, constants),
+            _context_for(chunk, context),
             f"Code:\n{chunk.source.rstrip()}",
             f"Draft summary:\n{draft.strip()}",
         ]
@@ -421,8 +432,7 @@ def build_critic_messages(
 def build_retry_messages(
     chunk: Chunk,
     role: Role,
-    imports: list[str],
-    constants: list[str],
+    context: FileContext,
     previous_draft: str,
     problems: str,
     found_by: ProblemSource = "critic",
@@ -433,7 +443,7 @@ def build_retry_messages(
     the validator rejected it. `problems` is the critic's critique, the
     validator's error messages, or both (`found_by="both"`).
     """
-    messages = build_generator_messages(chunk, role, imports, constants)
+    messages = build_generator_messages(chunk, role, context)
     retry_note = "\n\n".join(
         [
             f"Your previous draft:\n{previous_draft.strip()}",
@@ -471,16 +481,16 @@ def _generator_system(chunk: Chunk, spec: RoleSpec) -> str:
         "## Example\n"
         "This example is about a different function. It only shows the expected shape and "
         "level of detail; do not reuse its names or facts.\n\n"
-        f"{_file_context([], EXAMPLE_CONSTANTS)}\n\n"
+        f"{_file_context([], EXAMPLE_CONSTANTS, [])}\n\n"
         f"Python function to summarize:\n{EXAMPLE_SOURCE.rstrip()}\n\n"
         f"Answer for a {spec.display_name}:\n{_json(spec.example_summary)}",
     ]
     return "\n\n".join(sections)
 
 
-def _generator_user(chunk: Chunk, imports: list[str], constants: list[str]) -> str:
+def _generator_user(chunk: Chunk, context: FileContext) -> str:
     return (
-        f"{_file_context(imports, constants)}\n\n"
+        f"{_context_for(chunk, context)}\n\n"
         f"Python {_kind_word(chunk)} to summarize:\n\n{chunk.source.rstrip()}"
     )
 
@@ -494,7 +504,9 @@ def _critic_system(chunk: Chunk, spec: RoleSpec, pass_threshold: int) -> str:
         f"## The reader\n{spec.reader}",
         "## How to review\n"
         "1. ACCURACY: Compare every claim in the draft with the code. Look for invented names, "
-        "wrong behavior, and missing key behavior.\n"
+        'wrong behavior, and missing key behavior. Names listed under "Other definitions in '
+        'this file" exist in the file; a claim that one of them is missing or undefined is '
+        "an error.\n"
         "2. ROLE RUBRIC: Check the draft against each criterion below.\n"
         "3. RULES: Check that the draft follows the style rules for this reader.",
         f"## Rubric for a {spec.display_name}\n{_bullets(spec.rubric)}",
@@ -517,7 +529,8 @@ def _critic_system(chunk: Chunk, spec: RoleSpec, pass_threshold: int) -> str:
         "## Examples\n"
         "These examples are about a different function. They only show how to score and how "
         "to write a critique; do not reuse their names or facts.\n\n"
-        f"Example code:\n{_file_context([], EXAMPLE_CONSTANTS)}\n\n{EXAMPLE_SOURCE.rstrip()}\n\n"
+        f"Example code:\n{_file_context([], EXAMPLE_CONSTANTS, [])}\n\n"
+        f"{EXAMPLE_SOURCE.rstrip()}\n\n"
         f"Example 1. Draft:\n{_json(spec.example_summary)}\n"
         f"Answer: {_json(PASSING_VERDICT, indent=None)}\n\n"
         f"Example 2. Draft problem: {failing.draft_problem}\n"
@@ -543,10 +556,16 @@ def _output_schema(chunk: Chunk, spec: RoleSpec) -> str:
     )
 
 
-def _file_context(imports: list[str], constants: list[str]) -> str:
+def _context_for(chunk: Chunk, context: FileContext) -> str:
+    return _file_context(context.imports, context.constants, context.outlines_for(chunk))
+
+
+def _file_context(imports: list[str], constants: list[str], outlines: list[str]) -> str:
     return (
         f"File imports (for reference only):\n{_lines_or_none(imports)}\n\n"
-        f"File constants (for reference only):\n{_lines_or_none(constants)}"
+        f"File constants (for reference only):\n{_lines_or_none(constants)}\n\n"
+        "Other definitions in this file (for reference only; their code is not shown):\n"
+        f"{_lines_or_none(outlines)}"
     )
 
 
@@ -573,10 +592,12 @@ def _kind_word(chunk: Chunk) -> str:
 def _rules_for(spec: RoleSpec) -> tuple[str, ...]:
     """The general rules, with the two name rules worded for this reader."""
     if spec.uses_code_names:
+        reference = REFERENCE_RULE_WITH_NAMES
         no_inventing, be_specific = NO_INVENTED_NAMES, BE_SPECIFIC_WITH_NAMES
     else:
+        reference = REFERENCE_RULE_IN_BUSINESS_TERMS
         no_inventing, be_specific = NO_INVENTED_FACTS, BE_SPECIFIC_IN_BUSINESS_TERMS
-    return (ONLY_FROM_CODE, no_inventing, be_specific, *OTHER_RULES)
+    return (ONLY_FROM_CODE, reference, no_inventing, be_specific, *OTHER_RULES)
 
 
 def _bullets(items: tuple[str, ...]) -> str:
@@ -617,10 +638,10 @@ def _main(argv: list[str]) -> int:
     for chunk in result.chunks:
         if args.critic:
             messages = build_critic_messages(
-                chunk, role, "<draft summary goes here>", result.imports, result.constants
+                chunk, role, "<draft summary goes here>", result.context
             )
         else:
-            messages = build_generator_messages(chunk, role, result.imports, result.constants)
+            messages = build_generator_messages(chunk, role, result.context)
         print(f"{'=' * 30} {chunk.name} ({chunk.kind}) {'=' * 30}")
         for message in messages:
             print(f"--- {message['role'].upper()} ---\n{message['content']}\n")
