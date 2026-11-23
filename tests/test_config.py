@@ -30,6 +30,7 @@ def clean_env(monkeypatch):
         "KNOWCODE_MAX_TECHNICAL_RETRIES",
         "KNOWCODE_MAX_QUALITY_RETRIES",
         "KNOWCODE_PASS_THRESHOLD",
+        "KNOWCODE_CRITIC_RUNS",
         "KNOWCODE_MAX_CHUNK_TOKENS",
     ]:
         monkeypatch.delenv(name, raising=False)
@@ -46,6 +47,7 @@ def test_default_values():
     assert s.max_technical_retries == 3
     assert s.max_quality_retries == 1
     assert s.pass_threshold == 4
+    assert s.critic_runs == 2
     assert s.max_chunk_tokens == 6000
     assert s.request_timeout_seconds == 120.0
     assert s.retry_base_delay_seconds == 1.0
@@ -71,6 +73,13 @@ def test_environment_variables_override_defaults(monkeypatch):
 
 def test_invalid_value_fails_fast(monkeypatch):
     monkeypatch.setenv("KNOWCODE_PASS_THRESHOLD", "9")  # must be 1-5
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("runs", ["0", "4"])
+def test_critic_runs_must_be_1_to_3(monkeypatch, runs):
+    monkeypatch.setenv("KNOWCODE_CRITIC_RUNS", runs)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 

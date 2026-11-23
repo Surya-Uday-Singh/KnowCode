@@ -43,9 +43,10 @@ class Message(TypedDict):
     content: str
 
 
-# Who found the problems that a retry is asked to fix: the LLM critic, or our
-# own validator (unparseable JSON, programming terms in a PM summary, ...).
-ProblemSource = Literal["critic", "validator"]
+# Who found the problems that a retry is asked to fix: the LLM critic, our
+# own validator (unparseable JSON, programming terms in a PM summary, ...),
+# or both at once.
+ProblemSource = Literal["critic", "validator", "both"]
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +368,7 @@ SCORING_SCALE = (
 _PROBLEM_HEADERS: dict[ProblemSource, str] = {
     "critic": "A reviewer found these problems:",
     "validator": "An automatic check found these problems:",
+    "both": "A reviewer and an automatic check found these problems:",
 }
 
 
@@ -428,8 +430,8 @@ def build_retry_messages(
     """The generator messages again, with the previous draft and its problems added.
 
     `previous_draft` is the raw reply, which may not even be valid JSON when
-    the validator rejected it. `problems` is the critic's critique or the
-    validator's error message.
+    the validator rejected it. `problems` is the critic's critique, the
+    validator's error messages, or both (`found_by="both"`).
     """
     messages = build_generator_messages(chunk, role, imports, constants)
     retry_note = "\n\n".join(

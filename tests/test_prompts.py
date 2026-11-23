@@ -323,6 +323,15 @@ def test_retry_is_the_generator_prompt_plus_draft_and_critique(sample):
     assert "Rewrite the summary and fix these problems." in added
 
 
+def test_retry_with_problems_from_both_sources_says_so(sample):
+    chunk = chunk_named(sample, "round_price")
+    retry = build_retry_messages(
+        chunk, Role.QA, [], [], "{}", "From the reviewer:\n1. a", found_by="both"
+    )
+    user = retry[1]["content"]
+    assert "A reviewer and an automatic check found these problems:\nFrom the reviewer:" in user
+
+
 def test_retry_after_a_validator_error_says_so(sample):
     chunk = chunk_named(sample, "round_price")
     retry = build_retry_messages(

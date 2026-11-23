@@ -87,13 +87,18 @@ class Settings(BaseSettings):
         default=3, ge=0, validation_alias="KNOWCODE_MAX_TECHNICAL_RETRIES"
     )
     # Quality retries ask the generator to rewrite a draft using the critic's
-    # feedback. Kept at 1: one revision fixes most problems, and a hard cap
-    # guarantees the generate/critique loop always terminates.
+    # feedback (or the validator's). Kept at 1: one revision fixes most
+    # problems, and a hard cap guarantees the loop always terminates.
     max_quality_retries: int = Field(
         default=1, ge=0, validation_alias="KNOWCODE_MAX_QUALITY_RETRIES"
     )
     # A draft passes when the critic scores it at least this high (scale 1-5).
     pass_threshold: int = Field(default=4, ge=1, le=5, validation_alias="KNOWCODE_PASS_THRESHOLD")
+    # How many times the critic independently reads each draft. A single read
+    # in thinking mode sometimes misses errors another read catches, so by
+    # default two reads are made and the lower score counts (the draft passes
+    # only if both reads pass it). With three, the middle score counts.
+    critic_runs: int = Field(default=2, ge=1, le=3, validation_alias="KNOWCODE_CRITIC_RUNS")
 
     # --- Preprocessing -------------------------------------------------------
     # Largest chunk of source code we'll send in one request, in estimated

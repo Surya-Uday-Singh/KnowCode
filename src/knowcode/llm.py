@@ -344,7 +344,7 @@ def _setup_message(error: openai.APIStatusError) -> str:
 _FLASH_PRICES_CNY = {"cache_hit": 0.02, "cache_miss": 1.0, "output": 4.0}
 
 
-def _estimate_cost_cny(reply: LLMReply) -> float | None:
+def estimate_cost_cny(reply: LLMReply) -> float | None:
     if reply.prompt_tokens is None or reply.completion_tokens is None:
         return None
     cached = reply.cached_prompt_tokens or 0
@@ -368,7 +368,7 @@ def _print_reply(reply: LLMReply) -> None:
         valid = "yes"
     except ValueError:
         valid = "NO"
-    cost = _estimate_cost_cny(reply)
+    cost = estimate_cost_cny(reply)
     print(
         f"\nvalid JSON: {valid} | finish: {reply.finish_reason} | attempts: {reply.attempts}"
         f" | time: {reply.elapsed_seconds:.1f}s"
