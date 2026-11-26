@@ -494,3 +494,111 @@ def test_definitions_context_is_capped_with_a_count_of_the_rest():
     assert sum(len(o) + 1 for o in outlines[:-1]) <= 1500
     shown = len(outlines) - 1
     assert outlines[-1] == f"…(+{59 - shown} more)"
+
+
+# --- Constants built with frozenset, re.compile, f-strings --------------------------
+
+NAME_RULES = Path(__file__).parent / "fixtures" / "name_rules.py"
+
+
+def test_settings_block_is_setup_and_every_constant_is_shared():
+    result = preprocess_file(NAME_RULES, NO_LIMIT)
+    # No "script" part for a block that only defines values.
+    assert [c.name for c in result.chunks] == ["clean", "match"]
+    assert result.constants == [
+        'MATCHED = "matched"',
+        'UNMATCHED = "unmatched"',
+        "QUOTE_LIMIT = 400",
+        "_SENTENCE_ZONE = 0.6",
+        # multi-line constants are shared as written
+        '_SUFFIXES = frozenset(\n    "inc corp ltd llc "\n    "gmbh plc".split()\n)',
+        '_LETTERS = r"a-z"',
+        '_WORD_RE = re.compile(f"[{_LETTERS}]+", re.IGNORECASE)',
+        '_SENTENCE_END = re.compile(r"[.!?](?=\\s)")',
+    ]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'WORDS = frozenset("a b c".split())',
+        'PAIRS = (("x", "y"), ("z", "w"))',
+        'PATTERN = re.compile(r"\\d+", re.IGNORECASE | re.MULTILINE)',
+        "ESCAPED = re.escape('a.b')",
+        "NUMBERS = sorted({3, 1, 2})",
+        "LOWER = 'ABC'.lower()",
+        "BIGGER = LIMIT * 2",
+        'ROW_RE = re.compile(f"^{LIMIT}$")',
+        "SETTINGS = {'limit': LIMIT, 'names': list(('a', 'b'))}",
+    ],
+)
+def test_values_built_only_from_plain_values_are_constants(line):
+    result = preprocess(f"import re\nLIMIT = 10\n{line}\n\ndef f():\n    return 1\n", NO_LIMIT)
+    assert [c.name for c in result.chunks] == ["f"]
+    assert result.constants == ["LIMIT = 10", line]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "CONFIG = load_config()",
+        'DATA = open("data.csv").read()',
+        'HOME = os.environ.get("HOME")',
+        'ROOT = os.path.join("a", "b")',
+        "SIZE = len(load_config())",
+        "LATER = UNDEFINED_YET + 1",  # not a known constant
+    ],
+)
+def test_values_that_run_or_read_something_are_still_work(line):
+    result = preprocess(f"import os\n{line}\n\ndef f():\n    return 1\n", NO_LIMIT)
+    assert [c.kind for c in result.chunks] == ["script", "function"]
+    assert result.constants == []
+
+
+def test_working_block_shares_its_upper_case_constants_only():
+    source = code(
+        """
+        import csv
+        MAX_ROWS = 1000
+        rows = []
+        with open("data.csv") as f:
+            for row in csv.reader(f):
+                rows.append(row)
+        """
+    )
+    result = preprocess(source, NO_LIMIT)
+    [chunk] = result.chunks
+    assert chunk.kind == "script"
+    assert result.constants == ["MAX_ROWS = 1000"]  # rows = [] is a working variable
+
+
+def test_a_working_variable_does_not_make_later_values_constants():
+    source = code(
+        """
+        rows = []
+        rows.append(1)
+        COPY = list(rows)
+        """
+    )
+    # rows is filled in by the code, so COPY depends on running it.
+    assert preprocess(source, NO_LIMIT).constants == []
+
+
+def test_too_long_constant_is_listed_by_name_only():
+    table = "\n".join(f"    'key_{i}': {i}," for i in range(40))
+    result = preprocess(f"TABLE = {{\n{table}\n}}\n\ndef f():\n    return TABLE\n", NO_LIMIT)
+    assert result.constants == ["TABLE = …  # 42 lines, too long to show here"]
+
+
+def test_tuple_unpacking_is_shared_as_written():
+    result = preprocess("LOW, HIGH = 1, 10\n\ndef f():\n    return LOW\n", NO_LIMIT)
+    assert result.constants == ["LOW, HIGH = 1, 10"]
+
+
+def test_constants_sent_to_the_model_are_capped():
+    lines = "".join(f"CONSTANT_NUMBER_{i} = 'value number {i} with some text'\n" for i in range(80))
+    result = preprocess(lines + "\ndef f():\n    return 1\n", NO_LIMIT)
+    assert len(result.constants) == 80  # all kept in the result (and the run log)
+    shown = result.context.shown_constants()
+    assert shown[-1].startswith("…(+") and shown[-1].endswith(" more)")
+    assert sum(len(c) + 1 for c in shown[:-1]) <= 2000

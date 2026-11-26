@@ -575,7 +575,7 @@ def _output_schema(chunk: Chunk, spec: RoleSpec) -> str:
 
 
 def _context_for(chunk: Chunk, context: FileContext) -> str:
-    return _file_context(context.imports, context.constants, context.outlines_for(chunk))
+    return _file_context(context.imports, context.shown_constants(), context.outlines_for(chunk))
 
 
 def _file_context(imports: list[str], constants: list[str], outlines: list[str]) -> str:

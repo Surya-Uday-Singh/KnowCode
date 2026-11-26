@@ -418,3 +418,12 @@ def test_rule_one_covers_the_reference_sections(sample):
     assert "You may say this code uses them" in system
     pm_system = generator(sample, "round_price", Role.PM)[0]["content"]
     assert "You may say this code uses them" not in pm_system
+
+
+def test_multi_line_constants_reach_the_prompt():
+    result = preprocess_file(Path(__file__).parent / "fixtures" / "name_rules.py", 100_000)
+    chunk = next(c for c in result.chunks if c.name == "clean")
+    user = build_generator_messages(chunk, Role.QA, result.context)[1]["content"]
+    block = user.split("File constants (for reference only):\n", 1)[1].split("\n\n", 1)[0]
+    assert "QUOTE_LIMIT = 400" in block and "_SENTENCE_ZONE = 0.6" in block
+    assert '    "gmbh plc".split()' in block  # the multi-line frozenset, as written

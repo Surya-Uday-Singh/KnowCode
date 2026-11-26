@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import copy
 import math
+import re
 import sys
 import textwrap
 import tokenize
@@ -41,9 +42,12 @@ from pydantic import BaseModel, ConfigDict
 # Accurate enough for a size limit and avoids depending on a tokenizer library.
 CHARS_PER_TOKEN = 4
 
-# Constants longer than this aren't copied into the shared file context,
-# because that context is repeated in every prompt for the file.
-MAX_CONSTANT_CONTEXT_CHARS = 200
+# The file's constants are repeated in every prompt for the file, so they're
+# kept small: one constant is shown in full up to this many characters (it may
+# span several lines); a longer one is listed by name only. All constants sent
+# with one chunk are capped at the second limit.
+MAX_CONSTANT_CONTEXT_CHARS = 400
+MAX_CONSTANTS_CONTEXT_CHARS = 2000
 
 # Limits for the outlines of the file's other definitions, also repeated in
 # every prompt: one outline line, and all outlines sent with one chunk.
@@ -128,15 +132,24 @@ class FileContext(BaseModel):
         """
         own = chunk.name if chunk.parent is None else None
         others = [d.outline for d in self.definitions if d.name != own]
-        shown: list[str] = []
-        used = 0
-        for index, outline in enumerate(others):
-            if shown and used + len(outline) > MAX_DEFINITIONS_CONTEXT_CHARS:
-                shown.append(f"…(+{len(others) - index} more)")
-                break
-            shown.append(outline)
-            used += len(outline) + 1
-        return shown
+        return _capped(others, MAX_DEFINITIONS_CONTEXT_CHARS)
+
+    def shown_constants(self) -> list[str]:
+        """The file's constants as sent to the model, capped like the outlines."""
+        return _capped(self.constants, MAX_CONSTANTS_CONTEXT_CHARS)
+
+
+def _capped(lines: list[str], limit: int) -> list[str]:
+    """`lines` up to about `limit` characters, then one line counting the rest."""
+    shown: list[str] = []
+    used = 0
+    for index, line in enumerate(lines):
+        if shown and used + len(line) > limit:
+            shown.append(f"…(+{len(lines) - index} more)")
+            break
+        shown.append(line)
+        used += len(line) + 1
+    return shown
 
 
 class PreprocessResult(BaseModel):
@@ -144,7 +157,9 @@ class PreprocessResult(BaseModel):
 
     # File context, sent to the model with every chunk from this file.
     imports: list[str]  # import statements exactly as written
-    constants: list[str]  # short module-level constant assignments, e.g. "MAX_ROWS = 1000"
+    # module-level constants and settings as written, e.g. "MAX_ROWS = 1000" or
+    # '_WORDS = frozenset("a b".split())'; too-long ones by name only
+    constants: list[str]
     definitions: list[Definition] = []  # outline of every top-level function and class
 
     chunks: list[Chunk]  # in the order they appear in the file
@@ -217,6 +232,9 @@ def preprocess(source: str, max_chunk_tokens: int | None = None) -> PreprocessRe
     imports = _collect_imports(tree, source)
     definitions = [_definition(node) for node in tree.body if isinstance(node, _DEF_NODES)]
     constants: list[str] = []
+    # Names of the constants found so far, so a later constant built from an
+    # earlier one (e.g. re.compile(f"[{CHARS}]")) is recognised as a constant too.
+    known_constants: set[str] = set()
     chunks: list[Chunk] = []
     failures: list[ChunkFailure] = []
 
@@ -228,10 +246,11 @@ def preprocess(source: str, max_chunk_tokens: int | None = None) -> PreprocessRe
     def close_section() -> None:
         if not section:
             return
-        if all(_is_setup(stmt) for stmt in section):
-            # Only imports/constants: no summary, but keep constants as context.
-            constants.extend(_constant_lines(section, source))
-        else:
+        all_setup, section_constants = _section_constants(section, source, known_constants)
+        # Constants are shared as context whether or not the section also does
+        # real work, so every chunk is summarized knowing their values.
+        constants.extend(section_constants)
+        if not all_setup:
             # Imports and docstrings at the top of a script section are already
             # sent as file context, so leave them out of the chunk to avoid
             # showing the model the same lines twice.
@@ -470,16 +489,33 @@ def _is_import_or_docstring(stmt: ast.stmt) -> bool:
     )
 
 
-def _is_setup(stmt: ast.stmt) -> bool:
+# Python's convention for constants: UPPER_CASE names, optionally with a
+# leading underscore (MAX_ROWS, _DESIGNATORS).
+_CONSTANT_NAME = re.compile(r"_*[A-Z][A-Z0-9_]*")
+
+# Calls that only build a value out of plain values, without running any of
+# the project's own code: collections, conversions, string methods and
+# regular-expression compilation. Any other call (load_config(), open(...))
+# makes an assignment real work.
+_SAFE_BUILDERS = frozenset(
+    "frozenset set tuple list dict sorted str int float bool bytes range".split()
+)
+_SAFE_STRING_METHODS = frozenset(
+    "split rsplit splitlines strip lstrip rstrip lower upper casefold replace join format".split()
+)
+_SAFE_RE_FUNCTIONS = frozenset({"compile", "escape"})
+
+
+def _is_setup(stmt: ast.stmt, known: set[str]) -> bool:
     """True if a top-level statement only sets things up rather than doing work.
 
     Setup means: imports, the module docstring, `pass`, and assignments of
-    literal values (MAX_ROWS = 1000). An `if` or `try` block counts as setup
-    when everything inside it is setup, which covers patterns like
+    constant values (see `_is_constant_value`). An `if` or `try` block counts
+    as setup when everything inside it is setup, which covers patterns like
     `try: import json / except ImportError: json = None`.
 
     Anything else (function calls, loops, `with` blocks, assignments whose
-    value is computed) is real work and belongs in a script chunk.
+    value comes from running code) is real work and belongs in a script chunk.
     """
     if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
         return True
@@ -487,35 +523,134 @@ def _is_setup(stmt: ast.stmt) -> bool:
         # A bare string on its own line is a docstring or a comment-like note.
         return isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
     if isinstance(stmt, ast.Assign):
-        return _is_literal(stmt.value)
+        return _is_constant_value(stmt.value, known)
     if isinstance(stmt, ast.AnnAssign):
         # `x: int` (no value) is just a type declaration.
-        return stmt.value is None or _is_literal(stmt.value)
+        return stmt.value is None or _is_constant_value(stmt.value, known)
     if isinstance(stmt, (ast.If, ast.Try, ast.TryStar)):
         inner = [*stmt.body, *stmt.orelse, *getattr(stmt, "finalbody", [])]
         for handler in getattr(stmt, "handlers", []):
             inner.extend(handler.body)
-        return all(_is_setup(s) for s in inner)
+        return all(_is_setup(s, known) for s in inner)
     return False
 
 
-def _constant_lines(statements: list[ast.stmt], source: str) -> list[str]:
-    """Return the short, one-line constant assignments among `statements`.
+def _is_constant_value(node: ast.expr, known: set[str]) -> bool:
+    r"""True if `node` is a value built only from plain values, decided by
+    reading the code (nothing is run). Examples:
 
-    These are shared with every chunk as context, so a function that uses
-    MAX_ROWS is summarized knowing that MAX_ROWS is 1000. Multi-line values
-    (e.g. a large lookup table) are left out to keep every prompt small.
+        400, "abc", [1, 2]                         plain values
+        frozenset("inc ltd llc".split())           a collection built from them
+        re.compile(r"\d+", re.IGNORECASE)         a compiled pattern
+        re.compile(f"[{CHARS}]")                   built from an earlier constant
+
+    Anything that calls the project's own code or reads from outside
+    (load_config(), open("data.csv"), os.environ[...]) is not a constant value.
     """
-    found: list[str] = []
-    for stmt in statements:
-        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+    if _is_literal(node):
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in known
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_constant_value(item, known) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is not None and _is_constant_value(key, known) for key in node.keys) and all(
+            _is_constant_value(value, known) for value in node.values
+        )
+    if isinstance(node, ast.BinOp):  # e.g. A + B, re.I | re.M
+        return _is_constant_value(node.left, known) and _is_constant_value(node.right, known)
+    if isinstance(node, ast.UnaryOp):
+        return _is_constant_value(node.operand, known)
+    if isinstance(node, ast.JoinedStr):  # an f-string
+        return all(_is_constant_value(part, known) for part in node.values)
+    if isinstance(node, ast.FormattedValue):  # one {...} inside an f-string
+        return _is_constant_value(node.value, known) and (
+            node.format_spec is None or _is_constant_value(node.format_spec, known)
+        )
+    if isinstance(node, ast.Attribute):  # a regular-expression flag, e.g. re.IGNORECASE
+        return isinstance(node.value, ast.Name) and node.value.id == "re" and node.attr.isupper()
+    if isinstance(node, ast.Call):
+        return (
+            _is_safe_call(node.func, known)
+            and all(_is_constant_value(arg, known) for arg in node.args)
+            and all(_is_constant_value(kw.value, known) for kw in node.keywords)
+        )
+    return False
+
+
+def _is_safe_call(func: ast.expr, known: set[str]) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id in _SAFE_BUILDERS
+    if isinstance(func, ast.Attribute):
+        if isinstance(func.value, ast.Name) and func.value.id == "re":
+            return func.attr in _SAFE_RE_FUNCTIONS
+        # A string method on a constant value, e.g. "inc ltd".split()
+        return func.attr in _SAFE_STRING_METHODS and _is_constant_value(func.value, known)
+    return False
+
+
+def _section_constants(
+    section: list[ast.stmt], source: str, known: set[str]
+) -> tuple[bool, list[str]]:
+    """Look at one module-level section: is it only setup, and which of its
+    assignments are constants to share as context?
+
+    In a section that is only setup, every constant assignment is shared. In
+    a section that also does real work, only UPPER_CASE names are: a plain
+    `rows = []` there is a working variable that the code below fills in,
+    while `MAX_ROWS = 1000` is a constant. `known` is updated with the names
+    of the constants shared, in order.
+    """
+    # First pass: does the section do any real work? Assume every
+    # constant-looking assignment is a constant while deciding.
+    trial = set(known)
+    all_setup = all(_note_constant(stmt, trial) or _is_setup(stmt, trial) for stmt in section)
+
+    # Second pass, now that we know which rule applies. In a working section
+    # a lower-case name never counts, so nothing built from it does either
+    # (e.g. COPY = list(rows) after rows.append(...)).
+    shared: list[str] = []
+    for stmt in section:
+        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        if value is None or not _is_constant_value(value, known):
             continue
-        if stmt.lineno != stmt.end_lineno:
-            continue
-        text = ast.get_source_segment(source, stmt) or ast.unparse(stmt)
-        if len(text) <= MAX_CONSTANT_CONTEXT_CHARS:
-            found.append(text)
-    return found
+        names = _assigned_names(stmt)
+        is_upper_case = bool(names) and all(_CONSTANT_NAME.fullmatch(n) for n in names)
+        if all_setup or is_upper_case:
+            known.update(names)
+            shared.append(_constant_text(stmt, source))
+    return all_setup, shared
+
+
+def _note_constant(stmt: ast.stmt, known: set[str]) -> bool:
+    """If `stmt` assigns a constant value, add its names to `known` and return True."""
+    value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+    if value is None or not _is_constant_value(value, known):
+        return False
+    known.update(_assigned_names(stmt))
+    return True
+
+
+def _assigned_names(stmt: ast.Assign | ast.AnnAssign) -> list[str]:
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    names: list[str] = []
+    for target in targets:
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name):
+                names.append(node.id)
+    return names
+
+
+def _constant_text(stmt: ast.Assign | ast.AnnAssign, source: str) -> str:
+    """The constant as written in the source. Too long to repeat in every
+    prompt, it's listed by name only, so the model still knows it exists."""
+    text = ast.get_source_segment(source, stmt) or ast.unparse(stmt)
+    if len(text) <= MAX_CONSTANT_CONTEXT_CHARS:
+        return text
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    name = " = ".join(ast.unparse(target) for target in targets)
+    lines = (stmt.end_lineno or stmt.lineno) - stmt.lineno + 1
+    return f"{name} = …  # {lines} line{'s' if lines != 1 else ''}, too long to show here"
 
 
 # ---------------------------------------------------------------------------

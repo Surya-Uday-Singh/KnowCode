@@ -38,6 +38,8 @@ addopts = "-m 'not live'"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Fixtures are sample code to be summarized, kept exactly as written.
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 # E/F: errors and undefined names, I: import order, UP: modern syntax, B: likely bugs

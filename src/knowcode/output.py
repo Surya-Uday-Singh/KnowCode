@@ -287,7 +287,9 @@ def _file_markdown(report: Report) -> str:
         lines += ["", "## File setup", ""]
         lines.append("**Imports:** " + (", ".join(f"`{i}`" for i in report.imports) or "none"))
         lines.append("")
-        lines.append("**Constants:** " + (", ".join(f"`{c}`" for c in report.constants) or "none"))
+        # A constant can span several lines; show each on one line so it fits in inline code.
+        shown = [" ".join(c.split()) for c in report.constants]
+        lines.append("**Constants:** " + (", ".join(f"`{c}`" for c in shown) or "none"))
 
     unclear = [
         f"- **{o.chunk_name}:** {item}" for o in summarized for item in o.summary.unclear_from_code

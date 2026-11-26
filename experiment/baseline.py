@@ -345,7 +345,9 @@ def _file_markdown(source: str, result: PreprocessResult, outcomes: list[Baselin
     lines += ["", "## File setup", ""]
     lines.append("**Imports:** " + (", ".join(f"`{i}`" for i in result.imports) or "none"))
     lines.append("")
-    lines.append("**Constants:** " + (", ".join(f"`{c}`" for c in result.constants) or "none"))
+    # A constant can span several lines; show each on one line so it fits in inline code.
+    shown = [" ".join(c.split()) for c in result.constants]
+    lines.append("**Constants:** " + (", ".join(f"`{c}`" for c in shown) or "none"))
 
     unclear = [
         f"- **{o.chunk_name}:** {item}" for o in summarized for item in o.summary.unclear_from_code

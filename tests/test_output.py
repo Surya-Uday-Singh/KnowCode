@@ -314,3 +314,17 @@ def test_pm_file_level_json_has_no_code_sections():
     data = to_json(run_sample(Role.PM, "file", all_pass(Role.PM)))
     assert "connections" not in data and "setup" not in data
     assert set(data["by_field"]) == {"business_rules", "user_facing_behavior"}
+
+
+def test_multi_line_constants_are_shown_on_one_line_in_file_setup():
+    result = preprocess_file(Path(__file__).parent / "fixtures" / "name_rules.py", 100_000)
+    client = FakeLLMClient(
+        [
+            line
+            for name in ("clean", "match")
+            for line in (summary(Role.QA, name, "function"), verdict(5), verdict(5))
+        ]
+    )
+    outcomes = summarize_file(result, Role.QA, client, Settings(_env_file=None))
+    text = render(build_report("name_rules.py", Role.QA, "file", result, outcomes), "md")
+    assert '`_SUFFIXES = frozenset( "inc corp ltd llc " "gmbh plc".split() )`' in text
