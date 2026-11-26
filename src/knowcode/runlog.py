@@ -1,7 +1,8 @@
 """Save everything about a run to disk, so every result can be traced,
 checked and analysed later.
 
-Each run gets its own folder, e.g. runs/20261123-153012-a1b2/:
+Each run gets its own folder named after its start time and what was run,
+e.g. runs/20261123-153012-a1b2-qa/:
 
     run.json      what was run and how it went: inputs, every setting (never
                   the API key), the KnowCode version and git commit, a
@@ -22,19 +23,40 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import knowcode
 from knowcode.config import Settings
-from knowcode.llm import estimate_cost_cny
-from knowcode.pipeline import ChunkOutcome
+from knowcode.llm import LLMReply, estimate_cost_cny
 
 RunStatus = Literal["running", "finished", "stopped", "interrupted"]
+
+# What kind of summaries a run produced. Spelled out so a log explains itself
+# without the design document.
+ROLE_SPECIFIC = "role_specific"
+ROLE_SPECIFIC_DESCRIPTION = "Summary written for the chosen role (Condition B in the design doc)."
+
+
+class LoggedPart(Protocol):
+    """What the log needs from one part's result. The pipeline's ChunkOutcome
+    has all of this; other runners (e.g. experiments) can log their own
+    result type as long as it does too."""
+
+    chunk_name: str
+    start_line: int
+
+    @property
+    def failure_category(self) -> str | None: ...
+
+    def replies(self) -> list[LLMReply]: ...
+
+    def model_dump(self, *, mode: str) -> dict[str, Any]: ...
 
 
 class RunLog:
@@ -48,17 +70,24 @@ class RunLog:
         inputs: dict[str, Any],
         settings: Settings,
         source_text: str,
+        condition: str = ROLE_SPECIFIC,
+        condition_description: str = ROLE_SPECIFIC_DESCRIPTION,
+        label: str | None = None,
         now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
     ):
+        """`label` is added to the folder name (e.g. the role, "qa") so runs
+        can be told apart at a glance in the runs folder."""
         self._now = now
         self.started_at = now()
-        self.run_id, self.path = _new_run_folder(root, self.started_at)
+        self.run_id, self.path = _new_run_folder(root, self.started_at, label)
         self._task_ids: dict[tuple[str, int], str] = {}
         self._written: set[tuple[str, int]] = set()
 
         (self.path / "source.py").write_text(source_text, encoding="utf-8")
         self._run: dict[str, Any] = {
             "run_id": self.run_id,
+            "condition": condition,
+            "condition_description": condition_description,
             "status": "running",
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "ended_at": None,
@@ -70,7 +99,7 @@ class RunLog:
         }
         self._write_run()
 
-    def task_id(self, outcome: ChunkOutcome) -> str:
+    def task_id(self, outcome: LoggedPart) -> str:
         """A stable id for one part in this run, e.g. "20261123-153012-a1b2/Cart.add"."""
         key = (outcome.chunk_name, outcome.start_line)
         if key not in self._task_ids:
@@ -81,7 +110,7 @@ class RunLog:
             self._task_ids[key] = task_id
         return self._task_ids[key]
 
-    def add_part(self, outcome: ChunkOutcome) -> None:
+    def add_part(self, outcome: LoggedPart) -> None:
         """Append one part's full record to parts.jsonl."""
         key = (outcome.chunk_name, outcome.start_line)
         if key in self._written:
@@ -99,7 +128,7 @@ class RunLog:
     def finish(
         self,
         status: RunStatus,
-        outcomes: list[ChunkOutcome],
+        outcomes: list[LoggedPart],
         output_text: str | None = None,
         output_format: str = "md",
         error: str | None = None,
@@ -134,12 +163,15 @@ class RunLog:
         (self.path / "run.json").write_text(text, encoding="utf-8")
 
 
-def _new_run_folder(root: Path, started_at: datetime) -> tuple[str, Path]:
+def _new_run_folder(root: Path, started_at: datetime, label: str | None) -> tuple[str, Path]:
     """Make a folder named after the start time plus a short random suffix,
-    so two runs started in the same second never share a folder."""
+    so two runs started in the same second never share a folder, plus the
+    label if there is one."""
     root.mkdir(parents=True, exist_ok=True)
+    # Keep the label safe to use in a folder name.
+    suffix = f"-{re.sub(r'[^a-z0-9_]+', '-', label.lower()).strip('-')}" if label else ""
     while True:
-        run_id = f"{started_at:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
+        run_id = f"{started_at:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}{suffix}"
         path = root / run_id
         try:
             path.mkdir()
@@ -154,7 +186,7 @@ def _settings_record(settings: Settings) -> dict[str, Any]:
     return record
 
 
-def _part_totals(outcomes: list[ChunkOutcome]) -> dict[str, Any]:
+def _part_totals(outcomes: list[LoggedPart]) -> dict[str, Any]:
     replies = [reply for outcome in outcomes for reply in outcome.replies()]
 
     def total(field: str) -> int:

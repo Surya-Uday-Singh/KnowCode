@@ -108,7 +108,10 @@ def test_finished_run_writes_the_four_files():
 def test_run_json_records_inputs_settings_version_and_totals():
     full_sample_run()
     run_json = json.loads((the_run_folder() / "run.json").read_text())
-    assert re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", run_json["run_id"])
+    # start time, random suffix, then the role so runs are easy to tell apart
+    assert re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}-qa", run_json["run_id"])
+    assert run_json["condition"] == "role_specific"
+    assert "Summary written for the chosen role" in run_json["condition_description"]
     assert run_json["status"] == "finished"
     assert run_json["started_at"] and run_json["ended_at"]
     assert run_json["inputs"] == {

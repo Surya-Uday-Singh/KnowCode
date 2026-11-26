@@ -88,16 +88,29 @@ class FailingExample:
 
 @dataclass(frozen=True)
 class RoleSpec:
-    display_name: str  # how the role is named inside prompts
+    """Everything that differs between readers. The three roles below are
+    the ones the system offers; other code (such as experiments) can build
+    its own RoleSpec and pass it wherever a Role is accepted."""
+
+    display_name: str  # how the reader is named inside prompts
     reader: str
     fields: tuple[str, ...]  # keys of the "highlights" object, in order
     style: tuple[str, ...]
-    rubric: tuple[str, ...]
     example_summary: dict  # a good generator answer for EXAMPLE_SOURCE
-    failing_example: FailingExample
+    # The critic's rubric and worked failing verdict. A reader without them
+    # can still be used to generate summaries, but not to critique them.
+    rubric: tuple[str, ...] = ()
+    failing_example: FailingExample | None = None
     # False for readers who don't read code: their prompt gets versions of the
     # general rules that don't ask for names from the code.
     uses_code_names: bool = True
+    # Definitions for fields not in FIELD_DEFINITIONS (e.g. a custom reader's).
+    field_definitions: dict[str, str] | None = None
+
+
+def role_spec(role: Role | RoleSpec) -> RoleSpec:
+    """The RoleSpec for one of the system's roles, or the RoleSpec itself."""
+    return role if isinstance(role, RoleSpec) else ROLES[role]
 
 
 ROLES: dict[Role, RoleSpec] = {
@@ -390,18 +403,20 @@ _PROBLEM_HEADERS: dict[ProblemSource, str] = {
 # ---------------------------------------------------------------------------
 
 
-def build_generator_messages(chunk: Chunk, role: Role, context: FileContext) -> list[Message]:
+def build_generator_messages(
+    chunk: Chunk, role: Role | RoleSpec, context: FileContext
+) -> list[Message]:
     """Messages asking the model to summarize `chunk` for `role`. `context` is
     what the model is told about the rest of the file."""
     return [
-        {"role": "system", "content": _generator_system(chunk, ROLES[role])},
+        {"role": "system", "content": _generator_system(chunk, role_spec(role))},
         {"role": "user", "content": _generator_user(chunk, context)},
     ]
 
 
 def build_critic_messages(
     chunk: Chunk,
-    role: Role,
+    role: Role | RoleSpec,
     draft: str,
     context: FileContext,
     pass_threshold: int | None = None,
@@ -415,7 +430,9 @@ def build_critic_messages(
 
         pass_threshold = get_settings().pass_threshold
 
-    spec = ROLES[role]
+    spec = role_spec(role)
+    if not spec.rubric or spec.failing_example is None:
+        raise ValueError(f"{spec.display_name} has no critic rubric, so it can't be critiqued")
     user = "\n\n".join(
         [
             _context_for(chunk, context),
@@ -431,7 +448,7 @@ def build_critic_messages(
 
 def build_retry_messages(
     chunk: Chunk,
-    role: Role,
+    role: Role | RoleSpec,
     context: FileContext,
     previous_draft: str,
     problems: str,
@@ -462,6 +479,7 @@ def build_retry_messages(
 
 
 def _generator_system(chunk: Chunk, spec: RoleSpec) -> str:
+    definitions = spec.field_definitions or FIELD_DEFINITIONS
     sections = [
         "You are an expert code documentation assistant. You write summaries of Python code "
         f"for one specific reader: a {spec.display_name}.",
@@ -471,7 +489,7 @@ def _generator_system(chunk: Chunk, spec: RoleSpec) -> str:
         "1. EXPLAIN: In plain language, say what the code does and why it exists.\n"
         "2. HIGHLIGHT: Give the details this reader needs, using the fields below.",
         "## What this reader needs\n"
-        + "\n".join(f"- {name}: {FIELD_DEFINITIONS[name]}" for name in spec.fields),
+        + "\n".join(f"- {name}: {definitions[name]}" for name in spec.fields),
         f"## Style for this reader\n{_bullets(spec.style)}",
         f"## Rules for all roles\n{_bullets(_rules_for(spec))}",
         "## Output format\n"

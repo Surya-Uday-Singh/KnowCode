@@ -137,6 +137,7 @@ def main(
                 inputs=_inputs(args, source),
                 settings=settings,
                 source_text=source_text,
+                label=args.role,  # e.g. runs/20261125-101500-a1b2-qa/
             )
         except OSError as error:
             print(f"knowcode: cannot create a run log in {args.log_dir}: {error}", file=stderr)

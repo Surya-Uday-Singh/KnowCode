@@ -76,7 +76,7 @@ The `-e` means "editable": when you change the code, the command uses your chang
 ```bash
 pytest -q
 ```
-You should see something like `305 passed`. This is free: the tests use a fake LLM and never call DeepSeek.
+You should see something like `326 passed`. This is free: the tests use a fake LLM and never call DeepSeek.
 
 Then check your key with one real call (costs about ¥0.01, a fraction of a cent):
 ```bash
@@ -239,7 +239,42 @@ Exit codes (for scripts): `0` finished, `1` bad input, `2` run stopped (key or c
 
 ---
 
-## 9. Where things are in the code
+## 9. Experiment tools (`experiment/` folder)
+
+The `experiment/` folder is **not part of the KnowCode tool**. It holds code for the research
+experiment, which compares KnowCode's role-specific summaries against a generic baseline.
+
+### Generic baseline summaries
+A generic summary is written for **no particular reader**. It uses the same code splitting, file
+context, model, settings, prompt template and automatic checks as `knowcode summarize`, but:
+- there is no target role (one neutral list, "Key details", instead of a role's sections);
+- there is **no critic review**: write → automatic checks → one retry only if the checks found a problem.
+
+```bash
+python -m experiment.baseline tests/fixtures/sample_cart.py --granularity function --chunk round_price
+python -m experiment.baseline tests/fixtures/sample_cart.py --granularity file --format json --output cart_generic.json
+```
+It takes the same options as `knowcode summarize` except `--role`. Run it from the KnowCode folder
+with the virtual environment active. Each part costs about one generator call (≈ ¥0.003), and
+usually takes a few seconds.
+
+### Telling runs apart in `runs/`
+| | Folder name ends with | `run.json` → `condition` |
+|---|---|---|
+| `knowcode summarize --role qa …` | `-qa` (or `-developer`, `-pm`) | `role_specific` |
+| `python -m experiment.baseline …` | `-generic` | `generic_baseline` |
+
+`run.json` also has a one-sentence `condition_description`, and `inputs.role` is `null` for generic runs.
+
+### First drafts (before the critic) are in the logs
+For role-specific runs, `parts.jsonl` → `drafts[0]` is the summary as first written, **before** any
+critic feedback, and `drafts[1]` (if present) is the rewrite. Comparing generic summaries with
+`drafts[0]` isolates the effect of the role instructions alone; comparing with the final summary
+(`best_draft`) measures the whole system, critic included.
+
+---
+
+## 10. Where things are in the code
 
 | File | What it does |
 |---|---|
@@ -253,3 +288,4 @@ Exit codes (for scripts): `0` finished, `1` bad input, `2` run stopped (key or c
 | `src/knowcode/cli.py` | The `knowcode` command. |
 | `src/knowcode/config.py` | Settings, read from `.env`. |
 | `tests/` | The tests (`pytest`). `tests/fixtures/sample_cart.py` is the example file. |
+| `experiment/` | Experiment-only code, not part of the tool: `generic.py` (the generic reader's instructions) and `baseline.py` (generic baseline summaries). |

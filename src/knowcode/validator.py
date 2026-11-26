@@ -31,7 +31,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from knowcode.preprocessor import Chunk, FileContext
-from knowcode.prompts import ROLES, Role
+from knowcode.prompts import Role, RoleSpec, role_spec
 
 # Length guidelines given to the generator. Breaking them is only a warning.
 MIN_SENTENCES, MAX_SENTENCES = 2, 10
@@ -120,7 +120,7 @@ class VerdictCheck(BaseModel):
 def validate_summary(
     text: str,
     chunk: Chunk,
-    role: Role,
+    role: Role | RoleSpec,
     context: FileContext,
     truncated: bool = False,
 ) -> SummaryCheck:
@@ -146,13 +146,14 @@ def validate_summary(
     if data is None:
         return SummaryCheck(summary=None, errors=errors, warnings=warnings)
 
-    summary = _summary_from(data, ROLES[role].fields, errors, warnings)
+    spec = role_spec(role)
+    summary = _summary_from(data, spec.fields, errors, warnings)
     if summary is None:
         return SummaryCheck(summary=None, errors=errors, warnings=warnings)
 
     _check_name_and_kind(summary, chunk, errors)
     reader_text = _reader_text(summary)
-    if ROLES[role].uses_code_names:
+    if spec.uses_code_names:
         _check_names_exist(reader_text, chunk, context, errors)
     else:
         _check_no_jargon(reader_text, errors)
