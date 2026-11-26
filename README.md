@@ -76,7 +76,7 @@ The `-e` means "editable": when you change the code, the command uses your chang
 ```bash
 pytest -q
 ```
-You should see something like `326 passed`. This is free: the tests use a fake LLM and never call DeepSeek.
+You should see something like `349 passed`. This is free: the tests use a fake LLM and never call DeepSeek.
 
 Then check your key with one real call (costs about ¥0.01, a fraction of a cent):
 ```bash
